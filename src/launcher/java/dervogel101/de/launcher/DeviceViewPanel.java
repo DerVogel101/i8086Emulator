@@ -1,0 +1,258 @@
+package dervogel101.de.launcher;
+
+import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import java.awt.*;
+import java.util.Arrays;
+import java.util.function.Supplier;
+
+/** Labeled controls for the existing port map. CPU access stays in LauncherController. */
+final class DeviceViewPanel extends JTabbedPane {
+    private final Supplier<LauncherController> controller;
+    private final Runnable openStorage, newStorage, saveStorage, saveStorageAs, disconnectStorage;
+    private final JLabel storageStatus = new JLabel("Disconnected");
+    private final JLabel storageRegisters = new JLabel("Data: 0000  Address: 0000  Control: 00");
+    private final JSpinner channel = new JSpinner(new SpinnerNumberModel(0, 0, 127, 1));
+    private final JSpinner strength = new JSpinner(new SpinnerNumberModel(0, 0, 15, 1));
+    private final JLabel output = new JLabel("Output: 0");
+    private final JSpinner sign = new JSpinner(new SpinnerNumberModel(0, 0, 127, 1));
+    private final JTextField[] signLines = new JTextField[8];
+    private final JLabel[] signLabels = new JLabel[8];
+    private final JLabel signControl = new JLabel("Control: 0000");
+    private final JSpinner timer = new JSpinner(new SpinnerNumberModel(0, 0, 5, 1));
+    private final JLabel countdown = new JLabel("Countdown: 0");
+    private final JSpinner reload = new JSpinner(new SpinnerNumberModel(0, 0, 65535, 1));
+    private final JCheckBox enabled = new JCheckBox("Enabled");
+    private final JCheckBox periodic = new JCheckBox("Periodic");
+    private final JCheckBox irqEnabled = new JCheckBox("IRQ on expiry");
+    private final JComboBox<String> resolution = new JComboBox<>();
+    private final JComboBox<String> timerMode = new JComboBox<>(new String[]{"Automatic", "Manual"});
+    private final JLabel activeIrq = new JLabel("Active: none");
+    private final JLabel overflow = new JLabel("Overflow: no");
+    private final JTextField rawId = new JTextField("0000", 6);
+    private final boolean[] signDirty = new boolean[8];
+    private boolean syncing;
+    private boolean loaded;
+    private boolean timerDirty;
+    private int displayedChannel = -1, displayedSign = -1, displayedTimer = -1;
+
+    DeviceViewPanel(Supplier<LauncherController> controller, Runnable openStorage, Runnable newStorage,
+                    Runnable saveStorage, Runnable saveStorageAs, Runnable disconnectStorage) {
+        this.controller = controller;
+        this.openStorage = openStorage;
+        this.newStorage = newStorage;
+        this.saveStorage = saveStorage;
+        this.saveStorageAs = saveStorageAs;
+        this.disconnectStorage = disconnectStorage;
+        addTab("Redstone", redstonePanel());
+        addTab("Signs", signPanel());
+        addTab("Timers", timerPanel());
+        addTab("IRQ queue", irqPanel());
+        addTab("Storage", storagePanel());
+    }
+
+    private JPanel storagePanel() {
+        JPanel panel = vertical();
+        panel.add(row(storageStatus));
+        panel.add(row(storageRegisters));
+        panel.add(row(button("Open", openStorage), button("New", newStorage),
+                button("Save", saveStorage), button("Save As", saveStorageAs),
+                button("Disconnect", disconnectStorage)));
+        panel.add(row(new JLabel("Data 8160, address 8162, control 8164; edit registers in Raw ports.")));
+        return panel;
+    }
+
+    void resetForCpu() {
+        syncing = true;
+        for (JTextField line : signLines) line.setText("");
+        Arrays.fill(signDirty, false);
+        timerDirty = false;
+        displayedChannel = displayedSign = displayedTimer = -1;
+        loaded = false;
+        output.setText("Output strength: 0");
+        signControl.setText("Control: 0000");
+        countdown.setText("Countdown: 0");
+        activeIrq.setText("Active IRQ: none");
+        overflow.setText("Overflow: no");
+        storageStatus.setText("Disconnected");
+        storageRegisters.setText("Data: 0000  Address: 0000  Control: 00");
+        syncing = false;
+    }
+
+    private JPanel redstonePanel() {
+        JPanel panel = vertical();
+        channel.addChangeListener(e -> { if (!syncing) controller.get().selectChannel((Integer) channel.getValue()); });
+        panel.add(row(new JLabel("Channel (0–127)"), channel, new JLabel("Input strength (0–15)"), strength,
+                button("Set input", () -> controller.get().redstone((Integer) channel.getValue(), (Integer) strength.getValue()))));
+        panel.add(row(output, button("Send IRQ", () -> controller.get().sendIrq((Integer) channel.getValue()))));
+        panel.add(row(new JLabel("IRQ ID = channel number; output is written by the ROM.")));
+        return panel;
+    }
+
+    private JPanel signPanel() {
+        JPanel panel = vertical();
+        sign.addChangeListener(e -> { if (!syncing) { Arrays.fill(signDirty, false); controller.get().selectSign((Integer) sign.getValue()); } });
+        panel.add(row(new JLabel("Sign (0–127)"), sign,
+                button("Front click", () -> controller.get().signClick((Integer) sign.getValue(), true)),
+                button("Back click", () -> controller.get().signClick((Integer) sign.getValue(), false)),
+                button("Send IRQ", () -> controller.get().sendIrq(0x0100 | (Integer) sign.getValue()))));
+        for (int i = 0; i < signLines.length; i++) {
+            int line = i;
+            signLabels[i] = new JLabel((i < 4 ? "Front " + (i + 1) : "Back " + (i - 3)) + " (format 00)");
+            signLines[i] = new JTextField(18);
+            signLines[i].getDocument().addDocumentListener(new DocumentListener() {
+                private void changed() { if (!syncing) signDirty[line] = true; }
+                @Override public void insertUpdate(DocumentEvent e) { changed(); }
+                @Override public void removeUpdate(DocumentEvent e) { changed(); }
+                @Override public void changedUpdate(DocumentEvent e) { changed(); }
+            });
+            panel.add(row(signLabels[i], signLines[i], button("Apply", () -> applySignLine(line))));
+        }
+        panel.add(row(signControl, button("Reload text", () -> {
+            Arrays.fill(signDirty, false);
+            controller.get().selectSign((Integer) sign.getValue());
+        }), new JLabel("Text: up to 15 printable ASCII characters per line.")));
+        JPanel outer = new JPanel(new BorderLayout());
+        outer.add(new JScrollPane(panel), BorderLayout.CENTER);
+        return outer;
+    }
+
+    private void applySignLine(int line) {
+        try { controller.get().writeSignLine((Integer) sign.getValue(), line, signLines[line].getText()); }
+        catch (IllegalArgumentException error) { JOptionPane.showMessageDialog(this, error.getMessage()); }
+    }
+
+    private JPanel timerPanel() {
+        JPanel panel = vertical();
+        timer.addChangeListener(e -> { if (!syncing) { timerDirty = false; controller.get().selectTimer((Integer) timer.getValue()); } });
+        reload.addChangeListener(e -> { if (!syncing) timerDirty = true; });
+        enabled.addActionListener(e -> { if (!syncing) timerDirty = true; });
+        periodic.addActionListener(e -> { if (!syncing) timerDirty = true; });
+        irqEnabled.addActionListener(e -> { if (!syncing) timerDirty = true; });
+        resolution.addActionListener(e -> { if (!syncing) timerDirty = true; });
+        timerMode.addActionListener(e -> {
+            if (!syncing && loaded) controller.get().timerAutomatic((Integer) timer.getValue(), timerMode.getSelectedIndex() == 0);
+        });
+        panel.add(row(new JLabel("Timer (0–2 real time, 3–5 game time)"), timer, countdown));
+        panel.add(row(new JLabel("Wait/reload"), reload, new JLabel("Resolution"), resolution));
+        panel.add(row(enabled, periodic, irqEnabled));
+        panel.add(row(new JLabel("Expiry IRQ mode"), timerMode,
+                button("Apply timer", () -> controller.get().writeTimer((Integer) timer.getValue(), (Integer) reload.getValue(),
+                        (enabled.isSelected() ? 1 : 0) | (periodic.isSelected() ? 2 : 0) |
+                                (irqEnabled.isSelected() ? 4 : 0) | (resolution.getSelectedIndex() << 4))),
+                button("Reset timer", () -> { timerDirty = false; controller.get().resetTimer((Integer) timer.getValue()); }),
+                button("Reload settings", () -> { timerDirty = false; controller.get().selectTimer((Integer) timer.getValue()); }),
+                button("Send IRQ", () -> controller.get().sendIrq(timerId((Integer) timer.getValue())))));
+        panel.add(row(new JLabel("Manual suppresses future expiry IRQs; the countdown still advances.")));
+        return panel;
+    }
+
+    private JPanel irqPanel() {
+        JPanel panel = vertical();
+        panel.add(row(activeIrq, overflow));
+        panel.add(row(button("Acknowledge active", () -> controller.get().writeIo(0xFF02, 1)),
+                button("Clear overflow", () -> controller.get().writeIo(0xFF02, 4))));
+        panel.add(row(new JLabel("Raw device ID (hex)"), rawId, button("Send IRQ", () -> {
+            try {
+                int id = Integer.parseInt(rawId.getText().trim().replaceFirst("(?i)^0x", ""), 16);
+                if (id < 0 || id > 0xFFFF) throw new NumberFormatException();
+                controller.get().sendIrq(id);
+            } catch (NumberFormatException error) { JOptionPane.showMessageDialog(this, "Enter a 16-bit hex device ID."); }
+        })));
+        panel.add(row(new JLabel("IDs: redstone 00xx, sign 01xx, real timer 02xx, game timer 03xx.")));
+        return panel;
+    }
+
+    void update(LauncherController.DeviceSnapshot devices, LauncherController.ImageState images, boolean loaded) {
+        this.loaded = loaded;
+        syncing = true;
+        try {
+            channel.setValue(devices.channel());
+            sign.setValue(devices.signIndex());
+            timer.setValue(devices.timerIndex());
+            if (devices.channel() != displayedChannel) {
+                displayedChannel = devices.channel();
+                strength.setValue(Byte.toUnsignedInt(devices.redstone()[0]));
+            }
+            output.setText("Output strength: " + (Byte.toUnsignedInt(devices.redstone()[1]) & 15));
+            if (devices.signIndex() != displayedSign) {
+                displayedSign = devices.signIndex();
+                Arrays.fill(signDirty, false);
+            }
+            for (int i = 0; i < 8; i++) {
+                signLabels[i].setText((i < 4 ? "Front " + (i + 1) : "Back " + (i - 3)) +
+                        " (format %02X)".formatted(Byte.toUnsignedInt(devices.sign()[i * 16])));
+                String current = signText(devices.sign(), i);
+                if (signDirty[i] && signLines[i].getText().equals(current)) signDirty[i] = false;
+                if (!signDirty[i] && !signLines[i].getText().equals(current)) signLines[i].setText(current);
+            }
+            signControl.setText("Control: %04X".formatted(word(devices.sign(), 0x80)));
+            int control = Byte.toUnsignedInt(devices.timer()[4]);
+            countdown.setText("Countdown: " + word(devices.timer(), 0));
+            if (devices.timerIndex() != displayedTimer) {
+                displayedTimer = devices.timerIndex();
+                timerDirty = false;
+            }
+            int requestedControl = (enabled.isSelected() ? 1 : 0) | (periodic.isSelected() ? 2 : 0) |
+                    (irqEnabled.isSelected() ? 4 : 0) | (resolution.getSelectedIndex() << 4);
+            if (timerDirty && (Integer) reload.getValue() == word(devices.timer(), 2) &&
+                    requestedControl == (control & 0x37)) timerDirty = false;
+            if (!timerDirty) {
+                reload.setValue(word(devices.timer(), 2));
+                enabled.setSelected((control & 1) != 0);
+                periodic.setSelected((control & 2) != 0);
+                irqEnabled.setSelected((control & 4) != 0);
+                resolution.setModel(new DefaultComboBoxModel<>(devices.timerIndex() < 3
+                        ? new String[]{"1 ms", "5 ms", "10 ms", "50 ms"}
+                        : new String[]{"1 tick", "5 ticks", "10 ticks", "20 ticks"}));
+                resolution.setSelectedIndex((control >>> 4) & 3);
+            }
+            timerMode.setSelectedIndex(devices.timerAutomatic() ? 0 : 1);
+            boolean pending = (devices.irq()[2] & 2) != 0;
+            activeIrq.setText(pending ? "Active IRQ: %04X".formatted(word(devices.irq(), 0)) : "Active IRQ: none");
+            overflow.setText("Overflow: " + (((devices.irq()[2] & 4) != 0) ? "yes" : "no"));
+            storageStatus.setText(images.storageConnected()
+                    ? "Connected: " + (images.storagePath() == null ? "Unsaved" : images.storagePath().getFileName())
+                    + (images.storageDirty() ? " *" : "") : "Disconnected");
+            storageRegisters.setText("Data: %04X  Address: %04X  Control: %02X".formatted(
+                    word(devices.storage(), 0), word(devices.storage(), 2), devices.storage()[4] & 0xFF));
+        } finally { syncing = false; }
+    }
+
+    static int timerId(int timer) { return ((timer < 3 ? 2 : 3) << 8) | (timer % 3); }
+
+    static String signText(byte[] sign, int line) {
+        StringBuilder text = new StringBuilder();
+        for (int i = line * 16 + 1; i < line * 16 + 16; i++) {
+            int value = Byte.toUnsignedInt(sign[i]);
+            if (value == 0) break;
+            text.append(value >= 0x20 && value <= 0x7E ? Character.toString((char) value) : "\\x%02X".formatted(value));
+        }
+        return text.toString();
+    }
+
+    private static int word(byte[] bytes, int offset) {
+        return Byte.toUnsignedInt(bytes[offset]) | Byte.toUnsignedInt(bytes[offset + 1]) << 8;
+    }
+
+    private JButton button(String label, Runnable action) {
+        JButton button = new JButton(label);
+        button.addActionListener(e -> { if (loaded) action.run(); });
+        return button;
+    }
+
+    private static JPanel vertical() {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        return panel;
+    }
+
+    private static JPanel row(Component... components) {
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        for (Component component : components) panel.add(component);
+        panel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, panel.getPreferredSize().height));
+        return panel;
+    }
+}
