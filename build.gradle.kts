@@ -37,4 +37,10 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    val irqRom = providers.environmentVariable("IRQ_HANDLER_TEST_ROM").orNull
+    inputs.property("irqHandlerTestRom", irqRom ?: "<unset>")
+    if (!irqRom.isNullOrBlank()) {
+        inputs.files(file(irqRom), file(irqRom).resolveSibling("rom.bin"))
+            .withPropertyName("irqHandlerTestRomImages")
+    }
 }
