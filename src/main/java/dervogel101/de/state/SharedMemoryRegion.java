@@ -55,4 +55,17 @@ public final class SharedMemoryRegion {
             throw new IndexOutOfBoundsException("Shared memory offset: " + offset);
         }
     }
+
+    public byte[] snapshot() {
+        lock.readLock().lock();
+        try { return bytes.clone(); } finally { lock.readLock().unlock(); }
+    }
+
+    public void load(byte[] image) {
+        if (image.length != SIZE) throw new IllegalArgumentException("Shared memory must be exactly 64 KiB");
+        lock.writeLock().lock();
+        try { System.arraycopy(image, 0, bytes, 0, SIZE); } finally { lock.writeLock().unlock(); }
+    }
+
+    public void clear() { load(new byte[SIZE]); }
 }

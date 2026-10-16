@@ -16,6 +16,7 @@ public final class CPUInstructions {
     private final IoCpuControlInstructions ioCpuControl;
     private boolean interruptDelayRequested;
     private boolean waitStalled;
+    private int yieldMode = -1;
 
     public CPUInstructions(CPU8086 cpu, CPURegister registers, CPUMemory memory, CPUIO io) {
         this.cpu = cpu;
@@ -32,6 +33,7 @@ public final class CPUInstructions {
     public boolean execute(int opcode, int cs, int ip, boolean testPinHigh) {
         interruptDelayRequested = false;
         waitStalled = false;
+        yieldMode = -1;
         int segmentOverride = -1;
         int repeatPrefix = -1;
         boolean lockPrefix = false;
@@ -46,6 +48,16 @@ public final class CPUInstructions {
                 default -> registers.getDs();
             };
             opcode = cpu.fetch8();
+        }
+        if (opcode == 0x0F) {
+            if (segmentOverride != -1 || repeatPrefix != -1 || lockPrefix) throw unsupported(opcode, cs, ip);
+            int mode = cpu.fetch8();
+            if (mode > 1) {
+                throw new UnsupportedOperationException(
+                        "Unsupported YIELD mode %02X at %04X:%04X".formatted(mode, cs, ip));
+            }
+            yieldMode = mode;
+            return false;
         }
         if (lockPrefix && (repeatPrefix != -1 || !lockable(opcode))) throw unsupported(opcode, cs, ip);
         if (StringInstructions.handles(opcode)) {
@@ -93,6 +105,8 @@ public final class CPUInstructions {
     public boolean interruptDelayRequested() { return interruptDelayRequested; }
 
     public boolean waitStalled() { return waitStalled; }
+
+    public int yieldMode() { return yieldMode; }
 
     private boolean lockable(int opcode) {
         int modrm = memory.read8(registers.getCs(), registers.getIp());

@@ -341,7 +341,7 @@ class StackControlFlowInstructionsTest {
                 {0xFF, 0xD8}, // Far CALL with register operand
                 {0xFF, 0xE8}, // Far JMP with register operand
                 {0xFF, 0xF8}, // Group FF /7
-                {0x0F},       // Undocumented POP CS
+                {0x0F, 2},    // Reserved cooperative-yield mode
                 {0x68, 0, 0}, // 80186 PUSH immediate
                 {0x60},       // 80186 PUSHA
                 {0xC8, 0, 0, 0} // 80186 ENTER

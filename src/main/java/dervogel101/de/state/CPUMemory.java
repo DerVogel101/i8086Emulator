@@ -1,6 +1,11 @@
 package dervogel101.de.state;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.time.LocalDateTime;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.HardwareProfile;
 import java.util.Objects;
 
 public class CPUMemory {
@@ -17,6 +22,7 @@ public class CPUMemory {
     private final byte[] nvram = new byte[NVRAM_SIZE];
     private final SharedMemoryRegion sharedMemory;
     private final byte[] rom = new byte[ROM_SIZE];
+    private boolean clockAvailable = true, nvramAvailable = true, sharedAvailable = true;
     private long nvramVersion;
     private long savedNvramVersion;
 
@@ -26,6 +32,12 @@ public class CPUMemory {
 
     public CPUMemory(SharedMemoryRegion sharedMemory) {
         this.sharedMemory = Objects.requireNonNull(sharedMemory);
+    }
+
+    public void configureHardware(HardwareProfile profile) {
+        clockAvailable = profile.has(Hardware.CLOCK);
+        nvramAvailable = profile.has(Hardware.NVRAM);
+        sharedAvailable = profile.has(Hardware.SHARED_MEMORY);
     }
 
     public SharedMemoryRegion sharedMemory() {
@@ -42,7 +54,7 @@ public class CPUMemory {
 
     public int read16(int segment, int offset) {
         int address = physicalAddress(segment, offset);
-        if (address >= SHARED_START && address < ROM_START - 1) {
+        if (sharedAvailable && address >= SHARED_START && address < ROM_START - 1) {
             return sharedMemory.read16(address - SHARED_START);
         }
         return readPhysical8(address) | (readPhysical8(address + 1) << 8);
@@ -54,13 +66,15 @@ public class CPUMemory {
 
     public void write16(int segment, int offset, int value) {
         int address = physicalAddress(segment, offset);
-        if (address >= SHARED_START && address < ROM_START - 1) {
+        if (sharedAvailable && address >= SHARED_START && address < ROM_START - 1) {
             sharedMemory.write16(address - SHARED_START, value);
             return;
         }
         writePhysical8(address, value);
         writePhysical8(address + 1, value >>> 8);
     }
+
+    public byte[] romImage() { return rom.clone(); }
 
     public void loadRom(byte[] image) {
         Objects.requireNonNull(image);
@@ -96,16 +110,24 @@ public class CPUMemory {
     }
 
     public void updateClock(long poweredOnGameTicks, long dayTime, LocalDateTime hostTime) {
-        Objects.requireNonNull(hostTime);
+        updateTickClock(poweredOnGameTicks, dayTime);
+        updateRealtimeClock(hostTime);
+    }
+
+    public void updateTickClock(long poweredOnGameTicks, long dayTime) {
         int day = (int) ((dayTime / 24_000) & 0xFFFF);
         int tick = (int) poweredOnGameTicks;
-        int millisecond = hostTime.getNano() / 1_000_000;
-        clock[0] = (byte) millisecond;
-        clock[1] = (byte) (millisecond >>> 8);
         clock[2] = (byte) day;
         clock[3] = (byte) (day >>> 8);
         clock[4] = (byte) tick;
         clock[5] = (byte) (tick >>> 8);
+    }
+
+    public void updateRealtimeClock(LocalDateTime hostTime) {
+        Objects.requireNonNull(hostTime);
+        int millisecond = hostTime.getNano() / 1_000_000;
+        clock[0] = (byte) millisecond;
+        clock[1] = (byte) (millisecond >>> 8);
         clock[6] = (byte) hostTime.getHour();
         clock[7] = (byte) hostTime.getMinute();
         clock[8] = (byte) hostTime.getSecond();
@@ -118,9 +140,9 @@ public class CPUMemory {
     private int readPhysical8(int address) {
         address &= 0xFFFFF;
         if (address < CLOCK_START) return Byte.toUnsignedInt(ram[address]);
-        if (address < NVRAM_START) return Byte.toUnsignedInt(clock[address - CLOCK_START]);
-        if (address < SHARED_START) return Byte.toUnsignedInt(nvram[address - NVRAM_START]);
-        if (address < ROM_START) return sharedMemory.read8(address - SHARED_START);
+        if (address < NVRAM_START) return clockAvailable ? Byte.toUnsignedInt(clock[address - CLOCK_START]) : 0;
+        if (address < SHARED_START) return nvramAvailable ? Byte.toUnsignedInt(nvram[address - NVRAM_START]) : 0;
+        if (address < ROM_START) return sharedAvailable ? sharedMemory.read8(address - SHARED_START) : 0;
         return Byte.toUnsignedInt(rom[address - ROM_START]);
     }
 
@@ -128,7 +150,7 @@ public class CPUMemory {
         address &= 0xFFFFF;
         if (address < CLOCK_START) {
             ram[address] = (byte) value;
-        } else if (address >= NVRAM_START && address < SHARED_START) {
+        } else if (nvramAvailable && address >= NVRAM_START && address < SHARED_START) {
             synchronized (this) {
                 int index = address - NVRAM_START;
                 if (nvram[index] != (byte) value) {
@@ -136,7 +158,7 @@ public class CPUMemory {
                     nvramVersion++;
                 }
             }
-        } else if (address >= SHARED_START && address < ROM_START) {
+        } else if (sharedAvailable && address >= SHARED_START && address < ROM_START) {
             sharedMemory.write8(address - SHARED_START, value);
         }
     }
@@ -158,4 +180,17 @@ public class CPUMemory {
             return version;
         }
     }
+
+    public synchronized void writeState(DataOutput out) throws IOException {
+        out.write(ram); out.write(clock); out.write(nvram); out.write(rom);
+        out.writeLong(nvramVersion); out.writeLong(savedNvramVersion);
+    }
+
+    public synchronized void readState(DataInput in) throws IOException {
+        in.readFully(ram); in.readFully(clock); in.readFully(nvram); in.readFully(rom);
+        nvramVersion = in.readLong(); savedNvramVersion = in.readLong();
+        if (nvramVersion < 0 || savedNvramVersion < 0 || savedNvramVersion > nvramVersion)
+            throw new IOException("Invalid NVRAM versions");
+    }
+
 }

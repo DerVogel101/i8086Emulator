@@ -1,11 +1,19 @@
 package dervogel101.de;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+
 import dervogel101.de.state.CPUIO;
 import dervogel101.de.state.CPUMemory;
 import dervogel101.de.state.IoStorageDevice;
 import dervogel101.de.state.SharedMemoryRegion;
 
 import java.time.Clock;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.HardwareProfile;
+import dervogel101.de.i86.runtime.RedstoneIrqMode;
+import java.util.Arrays;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.nio.charset.Charset;
@@ -35,6 +43,9 @@ public final class CpuHostBridge {
     private final ArrayDeque<Integer> waitingIrqs = new ArrayDeque<>();
     private int activeIrq = -1;
     private boolean irqOverflow;
+    private HardwareProfile hardware = HardwareProfile.complete();
+    private final RedstoneIrqMode[] redstoneIrqs = new RedstoneIrqMode[128];
+    private final int[] signIrqSides = new int[128];
     private long lastGameTime;
     private long poweredOnGameTicks;
     private boolean hasGameTime;
@@ -46,6 +57,7 @@ public final class CpuHostBridge {
     private boolean nmiPending;
 
     CpuHostBridge(CPUMemory memory, CPUIO io, Clock clock) {
+        Arrays.fill(redstoneIrqs, RedstoneIrqMode.DISABLED);
         this.memory = memory;
         this.io = io;
         this.clock = clock;
@@ -72,16 +84,30 @@ public final class CpuHostBridge {
     }
 
     public void submitRedstoneInput(int channel, int strength) {
+        submitRedstoneInput(channel, strength, true);
+    }
+
+    /** Reattachment samples input silently instead of replaying missed IRQs. */
+    public void submitRedstoneInput(int channel, int strength, boolean notify) {
         if (channel < 0 || channel >= 128 || strength < 0 || strength > 15) {
             throw new IllegalArgumentException("Redstone channel or strength out of range");
         }
-        pendingInputs.add(() -> io.setRedstoneInput(channel, strength));
+        pendingInputs.add(() -> {
+            if (channel >= hardware.redstoneCapacity()) return;
+            int previous = io.read8(channel * 2);
+            io.setRedstoneInput(channel, strength);
+            if (notify && redstoneIrqs[channel].triggers(previous, strength)) enqueueIrq(channel);
+        });
     }
 
     public void submitSignClick(int sign, SignSide side) {
         if (sign < 0 || sign >= 128) throw new IllegalArgumentException("Sign index: " + sign);
         Objects.requireNonNull(side);
-        pendingInputs.add(() -> io.clickSign(sign, side == SignSide.FRONT));
+        pendingInputs.add(() -> {
+            if (sign >= hardware.signCapacity()) return;
+            io.clickSign(sign, side == SignSide.FRONT);
+            if ((signIrqSides[sign] & (side == SignSide.FRONT ? 1 : 2)) != 0) enqueueIrq(0x100 | sign);
+        });
     }
 
     /** Queue a raw 16-bit device ID; its high byte is type and low byte is device index. */
@@ -109,7 +135,32 @@ public final class CpuHostBridge {
         return automaticTimerIrqs[timer];
     }
 
+    void configureHardware(HardwareProfile profile) {
+        hardware = profile;
+        if (!profile.has(Hardware.INTERRUPTS)) {
+            activeIrq = -1;
+            waitingIrqs.clear();
+            irqOverflow = false;
+        }
+    }
+
+    public void submitRedstoneIrqMode(int channel, RedstoneIrqMode mode) {
+        if (channel < 0 || channel >= 128) throw new IllegalArgumentException("Redstone channel: " + channel);
+        Objects.requireNonNull(mode);
+        pendingInputs.add(() -> redstoneIrqs[channel] = mode);
+    }
+
+    public RedstoneIrqMode redstoneIrqMode(int channel) { return redstoneIrqs[channel]; }
+
+    public void submitSignIrqSides(int sign, int sides) {
+        if (sign < 0 || sign >= 128 || (sides & ~3) != 0) throw new IllegalArgumentException("Sign IRQ setting");
+        pendingInputs.add(() -> signIrqSides[sign] = sides);
+    }
+
+    public int signIrqSides(int sign) { return signIrqSides[sign]; }
+
     private void enqueueIrq(int deviceId) {
+        if (!hardware.has(Hardware.INTERRUPTS)) return;
         if (activeIrq < 0) activeIrq = deviceId;
         else {
             if (waitingIrqs.size() == 255) {
@@ -130,15 +181,30 @@ public final class CpuHostBridge {
     }
 
     public void submitResetPin(boolean high) {
+        submitResetPin(high, true);
+    }
+
+    /** A chunk reattachment resamples levels without synthesizing a missed edge. */
+    public void submitResetPin(boolean high, boolean notify) {
         pendingInputs.add(() -> {
-            if (high && !resetPinHigh) resetPending = true;
+            if (notify && high && !resetPinHigh) resetPending = true;
             resetPinHigh = high;
         });
     }
 
+    /** A manual NMI event leaves the external pin level intact. RESET still has priority. */
+    public void submitNmiPulse() {
+        pendingInputs.add(() -> { if (!resetPinHigh) nmiPending = true; });
+    }
+
     public void submitNmiPin(boolean high) {
+        submitNmiPin(high, true);
+    }
+
+    /** A chunk reattachment resamples levels without synthesizing a missed edge. */
+    public void submitNmiPin(boolean high, boolean notify) {
         pendingInputs.add(() -> {
-            if (high && !nmiPinHigh && !resetPinHigh) nmiPending = true;
+            if (notify && high && !nmiPinHigh && !resetPinHigh) nmiPending = true;
             nmiPinHigh = high;
         });
     }
@@ -171,7 +237,26 @@ public final class CpuHostBridge {
         return activeIrq >= 0;
     }
 
-    /** Called by the CPU thread once per step, including halted and waiting steps. */
+    /** Sample world time and advance game-tick timers once per host tick. */
+    public void beforeTick() {
+        beforeInstruction();
+        if (!hardware.has(Hardware.CLOCK)) return;
+        io.advanceTickTimers(poweredOnGameTicks, timerIrqs);
+        memory.updateTickClock(poweredOnGameTicks, dayTime);
+        io.setIrqStatus(activeIrq, irqOverflow);
+    }
+
+    /** Sample real time and advance real-time timers once per execution batch. */
+    public void beforeBatch() {
+        beforeInstruction();
+        if (!hardware.has(Hardware.CLOCK)) return;
+        Instant now = clock.instant();
+        io.advanceRealTimers(now.toEpochMilli(), timerIrqs);
+        memory.updateRealtimeClock(LocalDateTime.ofInstant(now, clock.getZone()));
+        io.setIrqStatus(activeIrq, irqOverflow);
+    }
+
+    /** Apply inputs and device commands between steps without sampling clocks. */
     public void beforeInstruction() {
         int commands = io.consumeIrqCommands();
         if ((commands & 4) != 0) irqOverflow = false;
@@ -181,10 +266,7 @@ public final class CpuHostBridge {
         while ((input = pendingInputs.poll()) != null) input.run();
         io.serviceStorageCommand();
         io.sendTerminalIfPending(this::appendTerminal);
-        Instant now = clock.instant();
-        io.advanceTimers(now.toEpochMilli(), poweredOnGameTicks, timerIrqs);
         io.setIrqStatus(activeIrq, irqOverflow);
-        memory.updateClock(poweredOnGameTicks, dayTime, LocalDateTime.ofInstant(now, clock.getZone()));
     }
 
     private synchronized void appendTerminal(byte[] bytes) {
@@ -200,6 +282,10 @@ public final class CpuHostBridge {
     }
 
     /** A read-only snapshot of the newest terminal characters. */
+    public void reportHostError(String message) {
+        if (hardware.has(Hardware.TERMINAL)) appendTerminal(message.getBytes(WINDOWS_1252));
+    }
+
     public synchronized String terminalText() {
         char[] text = new char[terminalLength];
         for (int i = 0; i < text.length; i++)
@@ -241,4 +327,42 @@ public final class CpuHostBridge {
     public void loadNvram(byte[] image) {
         memory.loadNvram(image);
     }
+
+    /** CPU worker only, after queued inputs have been applied at an instruction boundary. */
+    void writeState(DataOutput out) throws IOException {
+        out.writeInt(activeIrq); out.writeBoolean(irqOverflow); out.writeShort(waitingIrqs.size());
+        for (int id : waitingIrqs) out.writeShort(id);
+        for (boolean automatic : automaticTimerIrqs) out.writeBoolean(automatic);
+        for (RedstoneIrqMode mode : redstoneIrqs) out.writeByte(mode.ordinal());
+        for (int sides : signIrqSides) out.writeByte(sides);
+        out.writeLong(lastGameTime); out.writeLong(poweredOnGameTicks); out.writeBoolean(hasGameTime); out.writeLong(dayTime);
+        out.writeBoolean(testPinHigh); out.writeBoolean(resetPinHigh); out.writeBoolean(nmiPinHigh);
+        out.writeBoolean(resetPending); out.writeBoolean(nmiPending); out.writeUTF(terminalText());
+    }
+
+    void readState(DataInput in) throws IOException {
+        pendingInputs.clear(); waitingIrqs.clear();
+        activeIrq = in.readInt(); irqOverflow = in.readBoolean(); int count = in.readUnsignedShort();
+        if (activeIrq < -1 || activeIrq > 0xFFFF || count > 255 || (activeIrq < 0 && count != 0))
+            throw new IOException("Invalid IRQ queue");
+        for (int i = 0; i < count; i++) waitingIrqs.addLast(in.readUnsignedShort());
+        for (int i = 0; i < automaticTimerIrqs.length; i++) automaticTimerIrqs[i] = in.readBoolean();
+        for (int i = 0; i < redstoneIrqs.length; i++) {
+            int mode = in.readUnsignedByte();
+            if (mode >= RedstoneIrqMode.values().length) throw new IOException("Invalid redstone IRQ mode");
+            redstoneIrqs[i] = RedstoneIrqMode.values()[mode];
+        }
+        for (int i = 0; i < signIrqSides.length; i++) {
+            signIrqSides[i] = in.readUnsignedByte();
+            if (signIrqSides[i] > 3) throw new IOException("Invalid sign IRQ sides");
+        }
+        lastGameTime = in.readLong(); poweredOnGameTicks = in.readLong(); hasGameTime = in.readBoolean(); dayTime = in.readLong();
+        testPinHigh = in.readBoolean(); resetPinHigh = in.readBoolean(); nmiPinHigh = in.readBoolean();
+        resetPending = in.readBoolean(); nmiPending = in.readBoolean(); String terminal = in.readUTF();
+        if (terminal.length() > TERMINAL_CAPACITY) throw new IOException("Terminal log too large");
+        synchronized (this) {
+            terminalStart = 0; terminalLength = terminal.length(); terminal.getChars(0, terminalLength, terminalLog, 0);
+        }
+    }
+
 }

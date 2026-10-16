@@ -31,6 +31,8 @@ class CpuHostBridgeTest {
         assertEquals(0, io.read8(2));
         assertEquals(0, io.read16(0x0380));
         bridge.beforeInstruction();
+        bridge.beforeTick();
+        bridge.beforeBatch();
         assertEquals(2, memory.read16(0x9000, 0xFFF5));
         assertEquals(0, memory.read16(0x9000, 0xFFF7)); // First game-time submission sets power-on origin.
         assertEquals(13, memory.read8(0x9000, 0xFFF9));
@@ -42,6 +44,8 @@ class CpuHostBridgeTest {
         bridge.submitWorldTime(65_538, 48_000);
         assertEquals(0, io.read16(0x0380));
         bridge.beforeInstruction();
+        bridge.beforeTick();
+        bridge.beforeBatch();
         assertEquals(1, memory.read16(0x9000, 0xFFF7));
         assertEquals(0x0300, io.read16(0x0380));
 

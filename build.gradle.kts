@@ -2,6 +2,9 @@ plugins {
     id("java")
 }
 
+// Host-independent rules shared with the Minecraft host.
+sourceSets.main { java.srcDir("../emulator_i86_crafted/src/runtime/java") }
+
 val launcher by sourceSets.creating {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += output + compileClasspath

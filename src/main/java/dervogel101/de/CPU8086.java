@@ -7,14 +7,19 @@ import dervogel101.de.state.CPURegister;
 import dervogel101.de.instructions.CPUInstructions;
 
 import java.time.Clock;
+import java.io.*;
+import java.util.EnumMap;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.HardwareProfile;
 
 public class CPU8086 {
-    public enum StepOutcome { INSTRUCTION, EVENT, IDLE }
+    public enum StepOutcome { INSTRUCTION, EVENT, IDLE, YIELD_BATCH, YIELD_TICK }
     private final CPURegister registers;
     private final CPUMemory memory;
     private final CPUIO io;
     private final CpuHostBridge hostBridge;
     private final CPUInstructions instructions;
+    private HardwareProfile hardware = HardwareProfile.complete();
     private boolean halted;
     private int irqDelay;
 
@@ -39,8 +44,37 @@ public class CPU8086 {
         resetCpu();
     }
 
+    /** Host must change installed hardware only while powered off, on the CPU worker. */
+    public void configureHardware(HardwareProfile profile) {
+        if (profile.validationError().isPresent()) throw new IllegalArgumentException(profile.validationError().get());
+        hardware = profile;
+        memory.configureHardware(profile);
+        io.configureHardware(profile);
+        hostBridge.configureHardware(profile);
+    }
+
+    public HardwareProfile hardware() { return hardware; }
+
     public CpuHostBridge hostBridge() {
         return hostBridge;
+    }
+
+    /** Worker-only manual reset, preserving externally held pin levels and device state. */
+    public void reset() {
+        beforeInstruction();
+        hostBridge.consumeReset();
+        resetCpu();
+        hostBridge.discardNmi();
+    }
+
+    /** Worker-only host tick boundary, including powered-on paused CPUs. */
+    public void beforeTick() {
+        hostBridge.beforeTick();
+    }
+
+    /** Worker-only boundary before a scheduled batch or manual debugger step. */
+    public void beforeBatch() {
+        hostBridge.beforeBatch();
     }
 
     public void beforeInstruction() {
@@ -73,7 +107,11 @@ public class CPU8086 {
             if (instructions.interruptDelayRequested()) irqDelay = 1;
             else if (irqDelay > 0) irqDelay--;
         }
-        return instructions.waitStalled() ? StepOutcome.IDLE : StepOutcome.INSTRUCTION;
+        return switch (instructions.yieldMode()) {
+            case 0 -> StepOutcome.YIELD_BATCH;
+            case 1 -> StepOutcome.YIELD_TICK;
+            default -> instructions.waitStalled() ? StepOutcome.IDLE : StepOutcome.INSTRUCTION;
+        };
     }
 
     private void resetCpu() {
@@ -132,5 +170,68 @@ public class CPU8086 {
         int lo = fetch8();
         int hi = fetch8();
         return lo | (hi << 8);
+    }
+
+    /** Call on the owning worker between steps. Shared regions are saved once by the host. */
+    public byte[] saveState() throws IOException {
+        beforeInstruction();
+        var buffer = new ByteArrayOutputStream();
+        try (var out = new DataOutputStream(buffer)) {
+            out.writeInt(0x49383653); out.writeInt(1);
+            for (Hardware device : Hardware.values()) out.writeByte(hardware.count(device));
+            out.writeShort(registers.getAx());
+            out.writeShort(registers.getBx());
+            out.writeShort(registers.getCx());
+            out.writeShort(registers.getDx());
+            out.writeShort(registers.getSp());
+            out.writeShort(registers.getBp());
+            out.writeShort(registers.getSi());
+            out.writeShort(registers.getDi());
+            out.writeShort(registers.getCs());
+            out.writeShort(registers.getDs());
+            out.writeShort(registers.getSs());
+            out.writeShort(registers.getEs());
+            out.writeShort(registers.getIp());
+            out.writeShort(registers.getFlags());
+            out.writeBoolean(halted); out.writeByte(irqDelay);
+            memory.writeState(out); io.writeState(out); hostBridge.writeState(out);
+        }
+        return buffer.toByteArray();
+    }
+
+    public static CPU8086 restoreState(byte[] state, SharedMemoryRegion sharedMemory) throws IOException {
+        return restoreState(state, Clock.systemDefaultZone(), sharedMemory);
+    }
+
+    public static CPU8086 restoreState(byte[] state, Clock clock, SharedMemoryRegion sharedMemory) throws IOException {
+        if (state.length > 2 * 1024 * 1024) throw new IOException("CPU state exceeds 2 MiB");
+        try (var in = new DataInputStream(new ByteArrayInputStream(state))) {
+            if (in.readInt() != 0x49383653 || in.readInt() != 1) throw new IOException("Unsupported CPU state format");
+            var counts = new EnumMap<Hardware, Integer>(Hardware.class);
+            for (Hardware device : Hardware.values()) counts.put(device, in.readUnsignedByte());
+            CPU8086 next = new CPU8086(clock, sharedMemory);
+            next.configureHardware(new HardwareProfile(counts));
+            next.registers.setAx(in.readUnsignedShort());
+            next.registers.setBx(in.readUnsignedShort());
+            next.registers.setCx(in.readUnsignedShort());
+            next.registers.setDx(in.readUnsignedShort());
+            next.registers.setSp(in.readUnsignedShort());
+            next.registers.setBp(in.readUnsignedShort());
+            next.registers.setSi(in.readUnsignedShort());
+            next.registers.setDi(in.readUnsignedShort());
+            next.registers.setCs(in.readUnsignedShort());
+            next.registers.setDs(in.readUnsignedShort());
+            next.registers.setSs(in.readUnsignedShort());
+            next.registers.setEs(in.readUnsignedShort());
+            next.registers.setIp(in.readUnsignedShort());
+            next.registers.setFlags(in.readUnsignedShort());
+            next.halted = in.readBoolean(); next.irqDelay = in.readUnsignedByte();
+            if (next.irqDelay > 1) throw new IOException("Invalid interrupt shadow");
+            next.memory.readState(in); next.io.readState(in); next.hostBridge.readState(in);
+            if (in.read() != -1) throw new IOException("Trailing CPU state data");
+            return next;
+        } catch (IllegalArgumentException error) {
+            throw new IOException("Invalid CPU state", error);
+        }
     }
 }

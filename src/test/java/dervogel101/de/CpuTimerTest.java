@@ -27,29 +27,29 @@ class CpuTimerTest {
             io.write16(base + 2, 2);
             io.write8(base + 4, 7); // enabled, periodic, expiry IRQ
         }
-        bridge.beforeInstruction();
+        refresh(bridge);
         bridge.submitTimerAutomatic(0, false);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertFalse(bridge.timerAutomatic(0));
         assertTrue(bridge.timerAutomatic(1));
         clock.advance(2);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(2, io.read16(REAL)); // manual mode still reloads
         assertEquals(0x0201, io.read16(0xFF00)); // timer 1 remains automatic
 
         bridge.submitIrq(2, 0); // manual pulse works independently of expiry
-        bridge.beforeInstruction();
+        refresh(bridge);
         io.write8(0xFF02, 1);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0x0200, io.read16(0xFF00));
         io.write8(0xFF02, 1);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0, io.read8(0xFF02) & 2);
 
         bridge.submitTimerAutomatic(0, true);
-        bridge.beforeInstruction();
+        refresh(bridge);
         clock.advance(2);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0x0200, io.read16(0xFF00));
         assertThrows(IllegalArgumentException.class, () -> bridge.submitTimerAutomatic(6, false));
     }
@@ -81,14 +81,14 @@ class CpuTimerTest {
                 0xBA, 0x04, 0x81, 0xB0, 0x07, 0xEE,
                 0xBA, 0x00, 0x81, 0xED,
                 0xBA, 0x04, 0x81, 0xEC);
-        for (int i = 0; i < 6; i++) cpu.step();
+        for (int i = 0; i < 6; i++) step(cpu);
         assertEquals(2, cpu.ioForTest().read16(REAL));
         assertEquals(7, cpu.ioForTest().read8(REAL + 4));
-        cpu.step();
-        cpu.step();
+        step(cpu);
+        step(cpu);
         assertEquals(2, cpu.registers().getAx());
-        cpu.step();
-        cpu.step();
+        step(cpu);
+        step(cpu);
         assertEquals(7, cpu.registers().getAx());
     }
 
@@ -172,18 +172,18 @@ class CpuTimerTest {
         assertThrows(IllegalArgumentException.class, () -> bridge.submitIrq(-1, 0));
         assertThrows(IllegalArgumentException.class, () -> bridge.submitIrq(1, 256));
         bridge.submitIrq(1, 0);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0x0100, io.read16(0xFF00));
         io.write16(REAL + 2, 2);
         io.write8(REAL + 4, 7);
         clock.advance(1_000);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0x0100, io.read16(0xFF00)); // Active ID remains stable.
         assertEquals(6, io.read8(0xFF02)); // 500 expirations overflow the queue.
         assertEquals(2, io.read16(REAL));
         io.write8(0xFF02, 5); // ACK and clear, then a fresh expiry at this boundary.
         clock.advance(4);
-        bridge.beforeInstruction();
+        refresh(bridge);
         assertEquals(0x0200, io.read16(0xFF00));
         assertEquals(6, io.read8(0xFF02)); // Fresh overflow remains visible.
     }
@@ -194,7 +194,7 @@ class CpuTimerTest {
         CPU8086 cpu = boot(clock, 0x90);
         CPUIO io = cpu.ioForTest();
         cpu.hostBridge().submitWorldTime(500, 48_000);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(0, cpu.memory().read16(0x9000, 0xFFF7));
         assertEquals(2, cpu.memory().read16(0x9000, 0xFFF5));
         assertEquals(999, cpu.memory().read16(0x9000, 0xFFF3));
@@ -202,11 +202,11 @@ class CpuTimerTest {
         io.write16(GAME + 2, 2);
         io.write8(GAME + 4, 7);
         cpu.hostBridge().submitWorldTime(501, 48_000);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(1, io.read16(GAME));
         cpu.hostBridge().submitWorldTime(503, 72_000);
         clock.advance(2);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(1, io.read16(GAME));
         assertEquals(0x0300, io.read16(0xFF00));
         assertEquals(3, cpu.memory().read16(0x9000, 0xFFF5));
@@ -214,18 +214,18 @@ class CpuTimerTest {
         assertEquals(1, cpu.memory().read16(0x9000, 0xFFF3));
         assertEquals(16, cpu.memory().read8(0x9000, 0xFFFB));
         cpu.hostBridge().submitResetPin(true);
-        cpu.step();
+        step(cpu);
         assertEquals(3, cpu.memory().read16(0x9000, 0xFFF7));
         assertEquals(1, io.read16(GAME));
         assertEquals(0x0300, io.read16(0xFF00));
         cpu.hostBridge().submitWorldTime(503 + 65_536, 72_000);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(3, cpu.memory().read16(0x9000, 0xFFF7)); // 16-bit view wraps.
         cpu.hostBridge().submitWorldTime(500, 72_000);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(3, cpu.memory().read16(0x9000, 0xFFF7)); // Backward game time cannot subtract uptime.
         cpu.hostBridge().submitWorldTime(505, 72_000);
-        cpu.beforeInstruction();
+        refresh(cpu);
         assertEquals(8, cpu.memory().read16(0x9000, 0xFFF7));
     }
 
@@ -240,14 +240,14 @@ class CpuTimerTest {
         cpu.registers().setIF(true);
         cpu.ioForTest().write16(REAL + 2, 2);
         cpu.ioForTest().write8(REAL + 4, 5); // Enabled, one-shot, IRQ enabled.
-        cpu.step();
+        step(cpu);
         assertTrue(cpu.isHalted());
         clock.advance(-10);
-        cpu.step();
+        step(cpu);
         assertTrue(cpu.isHalted());
         assertEquals(2, cpu.ioForTest().read16(REAL));
         clock.advance(2);
-        cpu.step();
+        step(cpu);
         assertFalse(cpu.isHalted());
         assertEquals(0x0100, cpu.registers().getIp());
         assertEquals(1, cpu.memory().read16(0x3000, 0x00FA));
@@ -262,8 +262,23 @@ class CpuTimerTest {
         for (int i = 0; i < program.length; i++) rom[i] = (byte) program[i];
         CPU8086 cpu = new CPU8086(clock);
         cpu.hostBridge().loadRom(rom);
-        cpu.step();
+        step(cpu);
         return cpu;
+    }
+
+    private static void refresh(CpuHostBridge bridge) {
+        bridge.beforeTick();
+        bridge.beforeBatch();
+    }
+
+    private static void refresh(CPU8086 cpu) {
+        cpu.beforeTick();
+        cpu.beforeBatch();
+    }
+
+    private static void step(CPU8086 cpu) {
+        refresh(cpu);
+        cpu.step();
     }
 
     private static final class MutableClock extends Clock {

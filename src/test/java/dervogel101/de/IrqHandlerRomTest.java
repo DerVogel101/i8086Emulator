@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.function.BooleanSupplier;
@@ -20,6 +21,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class IrqHandlerRomTest {
     private static final int STEP_LIMIT = 200_000;
     private CPU8086 cpu;
+    private long millis;
+    private long gameTicks;
+    private final Clock clock = new Clock() {
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) { return this; }
+        @Override public Instant instant() { return Instant.ofEpochMilli(millis); }
+    };
 
     @BeforeEach
     void boot() throws IOException {
@@ -30,8 +38,11 @@ class IrqHandlerRomTest {
         assertEquals(0x40000, image.length, "ROM must be exactly 256 KiB");
         assertArrayEquals(new byte[]{(byte) 0xEA, 0, 0, 0, (byte) 0xC0},
                 Arrays.copyOfRange(image, 0x3FFF0, 0x3FFF5));
-        cpu = new CPU8086(Clock.fixed(Instant.EPOCH, ZoneOffset.UTC));
+        cpu = new CPU8086(clock);
         cpu.hostBridge().loadRom(image);
+        cpu.hostBridge().submitWorldTime(0, 0);
+        cpu.beforeTick();
+        cpu.beforeBatch();
         await(() -> word(0) == 0x4952, "ROM startup and registration self-checks");
         assertEquals(6, word(8), "Registration records must occupy six bytes");
         assertEquals(0xC000, cpu.memory().read16(0, 0x0082));
@@ -184,6 +195,97 @@ class IrqHandlerRomTest {
         cpu.ioForTest().write8(0xFF02, 4);
         cpu.step();
         assertEquals(0, cpu.ioForTest().read8(0xFF02));
+    }
+
+    @Test
+    void sleepUsesBatchYieldForBothClocksAndAllResolutionsWithoutBlockingIrqs() {
+        int[][] units = {{1, 5, 10, 50}, {1, 5, 10, 20}};
+        for (int mode = 0; mode < 2; mode++) {
+            int timer = mode == 0 ? 0x8110 : 0x8128;
+            for (int resolution = 0; resolution < 4; resolution++) {
+                int completed = word(7);
+                startSleep(16 + mode, 2, resolution << 4);
+                awaitBatchYield();
+                assertTrue(cpu.registers().getIF());
+                assertEquals(1 | (resolution << 4), cpu.ioForTest().read8(timer + 4));
+                irq(0x0100, 2);
+                assertEquals(completed, word(7), "IRQ must return to the sleeping call");
+                advanceSleepClock(1 - mode, 1000);
+                awaitBatchYield();
+                assertEquals(completed, word(7), "The other clock must not expire the sleep");
+                advanceSleepClock(mode, 2 * units[mode][resolution] - 1);
+                awaitBatchYield();
+                assertEquals(completed, word(7), "Sleep must not return early");
+                advanceSleepClock(mode, 1);
+                await(() -> word(7) == completed + 1, "sleep expiry");
+                assertEquals(0, cpu.ioForTest().read16(timer));
+                assertEquals(resolution << 4, cpu.ioForTest().read8(timer + 4));
+                assertTrue(cpu.registers().getIF());
+                assertFalse(cpu.hostBridge().irqPending());
+            }
+        }
+    }
+
+    @Test
+    void sleepPreservesDisabledInterruptsAndSupportsMaximumWait() {
+        for (int mode = 0; mode < 2; mode++) {
+            int completed = word(7);
+            int callbacks = word(5);
+            startSleep(18 + mode, 0xFFFF, 0xFF);
+            awaitBatchYield();
+            assertFalse(cpu.registers().getIF());
+            int timer = mode == 0 ? 0x8110 : 0x8128;
+            assertEquals(0x31, cpu.ioForTest().read8(timer + 4), "Only resolution bits are accepted");
+            cpu.hostBridge().submitIrq(0x0100);
+            advanceSleepClock(mode, 0xFFFFL * (mode == 0 ? 50 : 20) - 1);
+            awaitBatchYield();
+            assertEquals(callbacks, word(5));
+            assertFalse(cpu.registers().getIF());
+            assertTrue(cpu.hostBridge().irqPending());
+            advanceSleepClock(mode, 1);
+            await(() -> word(7) == completed + 1, "disabled-IF sleep expiry and C IF check");
+            await(() -> word(5) == callbacks + 1 && !cpu.hostBridge().irqPending(), "deferred IRQ");
+        }
+    }
+
+    @Test
+    void zeroSleepDoesNotYieldOrReconfigureTimers() {
+        for (int command = 16; command <= 19; command++) {
+            int timer = (command & 1) == 0 ? 0x8110 : 0x8128;
+            cpu.ioForTest().write16(timer + 2, 123);
+            int completed = word(7);
+            startSleep(command, 0, 0xFF);
+            for (int step = 0; word(7) == completed && step < STEP_LIMIT; step++)
+                assertNotEquals(CPU8086.StepOutcome.YIELD_BATCH, cpu.step());
+            assertEquals(completed + 1, word(7));
+            assertEquals(0, word(1), "C IF preservation check");
+            assertEquals(123, cpu.ioForTest().read16(timer + 2));
+            assertEquals(0, cpu.ioForTest().read8(timer + 4));
+        }
+    }
+
+    private void startSleep(int command, int wait, int resolution) {
+        cpu.memory().write16(0, 0x051A, wait);
+        cpu.memory().write16(0, 0x051C, resolution);
+        cpu.memory().write16(0, 0x0504, command);
+    }
+
+    private void advanceSleepClock(int mode, long amount) {
+        if (mode == 0) millis += amount;
+        else cpu.hostBridge().submitWorldTime(gameTicks += amount, 0);
+        cpu.beforeTick();
+        cpu.beforeBatch();
+    }
+
+    private void awaitBatchYield() {
+        for (int step = 0; step < STEP_LIMIT; step++) {
+            assertEquals(0, word(1), "C sleep self-check");
+            CPU8086.StepOutcome outcome = cpu.step();
+            assertNotEquals(CPU8086.StepOutcome.YIELD_TICK, outcome);
+            assertFalse(cpu.isHalted(), "Sleep must yield rather than halt");
+            if (outcome == CPU8086.StepOutcome.YIELD_BATCH) return;
+        }
+        fail("Sleep did not yield a batch");
     }
 
     private int word(int index) {

@@ -1,6 +1,11 @@
 package dervogel101.de.state;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.Arrays;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.HardwareProfile;
 import java.util.BitSet;
 import java.util.HashMap;
 import java.util.Map;
@@ -20,6 +25,7 @@ public class CPUIO {
     private static final int[] REAL_RESOLUTIONS = {1, 5, 10, 50};
     private static final int[] GAME_RESOLUTIONS = {1, 5, 10, 20};
 
+    private HardwareProfile hardware = HardwareProfile.complete();
     private final byte[] ports = new byte[1 << 16];
     private final BitSet changedRedstone = new BitSet(128);
     private final BitSet changedSigns = new BitSet(SIGN_COUNT);
@@ -39,8 +45,23 @@ public class CPUIO {
         for (int i = 0; i < timers.length; i++) timers[i] = new Timer();
     }
 
+    public synchronized void configureHardware(HardwareProfile profile) {
+        hardware = profile;
+    }
+
+    private boolean available(int port) {
+        if (port < SIGN_FIRST) return (port >>> 1) < hardware.redstoneCapacity();
+        if (port <= SIGN_LAST) return ((port - SIGN_FIRST) >>> 8) < hardware.signCapacity();
+        if (port >= TIMER_FIRST && port <= TIMER_LAST) return hardware.has(Hardware.CLOCK);
+        if (port >= TERMINAL_FIRST && port <= TERMINAL_CONTROL) return hardware.has(Hardware.TERMINAL);
+        if (port >= STORAGE_FIRST && port <= STORAGE_CONTROL) return hardware.has(Hardware.DISK);
+        if (port >= IRQ_FIRST) return hardware.has(Hardware.INTERRUPTS);
+        return false;
+    }
+
     public synchronized int read8(int port) {
         port &= 0xFFFF;
+        if (!available(port)) return 0;
         if (port == IRQ_FIRST) return irqPending ? irqId & 0xFF : 0;
         if (port == IRQ_FIRST + 1) return irqPending ? irqId >>> 8 : 0;
         if (port == IRQ_FIRST + 2) return (irqPending ? 2 : 0) | (irqOverflow ? 4 : 0);
@@ -77,6 +98,7 @@ public class CPUIO {
 
     public synchronized void write8(int port, int value) {
         port &= 0xFFFF;
+        if (!available(port)) return;
         if (port == IRQ_FIRST + 2) {
             irqCommands |= value & 5;
             return;
@@ -162,7 +184,7 @@ public class CPUIO {
     public synchronized void serviceStorageCommand() {
         int commands = storageCommands;
         storageCommands = 0;
-        if (storageDevice == null) return;
+        if (storageDevice == null || !hardware.has(Hardware.DISK)) return;
         if ((commands & 1) != 0) storageData = storageDevice.readWord(storageAddress);
         else if ((commands & 2) != 0) storageDevice.writeWord(storageAddress, storageData);
     }
@@ -194,19 +216,33 @@ public class CPUIO {
         void queue(int deviceId, long count);
     }
 
-    /** Called once per instruction boundary; elapsed time is handled without per-unit iteration. */
+    /** Advance both timer groups; hosts normally use the separate tick/batch hooks. */
     public synchronized void advanceTimers(long realMillis, long gameTicks, IrqSink irqSink) {
+        advanceRealTimers(realMillis, irqSink);
+        advanceTickTimers(gameTicks, irqSink);
+    }
+
+    public synchronized void advanceRealTimers(long realMillis, IrqSink irqSink) {
+        if (!hardware.has(Hardware.CLOCK)) return;
         long realElapsed = lastRealMillis == Long.MIN_VALUE || realMillis < lastRealMillis
                 ? 0 : realMillis - lastRealMillis;
+        lastRealMillis = realMillis;
+        advanceTimers(0, 3, realElapsed, irqSink);
+    }
+
+    public synchronized void advanceTickTimers(long gameTicks, IrqSink irqSink) {
+        if (!hardware.has(Hardware.CLOCK)) return;
         long gameElapsed = lastGameTicks == Long.MIN_VALUE || gameTicks < lastGameTicks
                 ? 0 : gameTicks - lastGameTicks;
-        lastRealMillis = realMillis;
         lastGameTicks = gameTicks;
-        for (int i = 0; i < timers.length; i++) {
+        advanceTimers(3, 6, gameElapsed, irqSink);
+    }
+
+    private void advanceTimers(int first, int end, long elapsed, IrqSink irqSink) {
+        for (int i = first; i < end; i++) {
             Timer timer = timers[i];
             if ((timer.control & 1) == 0 || timer.countdown == 0) continue;
             int resolution = (i < 3 ? REAL_RESOLUTIONS : GAME_RESOLUTIONS)[(timer.control >>> 4) & 3];
-            long elapsed = i < 3 ? realElapsed : gameElapsed;
             long units = elapsed / resolution;
             timer.remainder += (int) (elapsed % resolution);
             if (timer.remainder >= resolution) {
@@ -240,11 +276,12 @@ public class CPUIO {
     public synchronized void setRedstoneInput(int channel, int strength) {
         checkIndex(channel);
         if (strength < 0 || strength > 15) throw new IllegalArgumentException("Redstone strength: " + strength);
-        ports[channel * 2] = (byte) strength;
+        if (channel < hardware.redstoneCapacity()) ports[channel * 2] = (byte) strength;
     }
 
     public synchronized void clickSign(int sign, boolean front) {
         checkIndex(sign);
+        if (sign >= hardware.signCapacity()) return;
         ports[SIGN_FIRST + sign * 0x100 + 0x81] |= (byte) (front ? 0x03 : 0x05);
     }
 
@@ -279,4 +316,37 @@ public class CPUIO {
             return bytes.clone();
         }
     }
+
+    public synchronized IoStorageDevice storageDevice() { return storageDevice; }
+
+    public synchronized void writeState(DataOutput out) throws IOException {
+        out.write(ports);
+        for (int i = 0; i < 128; i++) { out.writeBoolean(changedRedstone.get(i)); out.writeBoolean(changedSigns.get(i)); }
+        out.writeInt(irqId); out.writeBoolean(irqPending); out.writeBoolean(irqOverflow); out.writeInt(irqCommands);
+        out.writeShort(storageData); out.writeShort(storageAddress); out.writeByte(storageCommands);
+        out.writeBoolean(storageDevice != null);
+        if (storageDevice != null) storageDevice.writeState(out);
+        out.writeLong(lastRealMillis); out.writeLong(lastGameTicks);
+        for (Timer timer : timers) {
+            out.writeShort(timer.countdown); out.writeShort(timer.wait); out.writeByte(timer.control); out.writeByte(timer.remainder);
+        }
+    }
+
+    public synchronized void readState(DataInput in) throws IOException {
+        in.readFully(ports); changedRedstone.clear(); changedSigns.clear();
+        for (int i = 0; i < 128; i++) { changedRedstone.set(i, in.readBoolean()); changedSigns.set(i, in.readBoolean()); }
+        irqId = in.readInt(); irqPending = in.readBoolean(); irqOverflow = in.readBoolean(); irqCommands = in.readInt();
+        storageData = in.readUnsignedShort(); storageAddress = in.readUnsignedShort(); storageCommands = in.readUnsignedByte();
+        if (irqId < -1 || irqId > 0xFFFF || (irqCommands & ~5) != 0 || (storageCommands & ~3) != 0)
+            throw new IOException("Invalid I/O state");
+        storageDevice = in.readBoolean() ? new IoStorageDevice() : null;
+        if (storageDevice != null) storageDevice.readState(in);
+        lastRealMillis = in.readLong(); lastGameTicks = in.readLong();
+        for (Timer timer : timers) {
+            timer.countdown = in.readUnsignedShort(); timer.wait = in.readUnsignedShort();
+            timer.control = in.readUnsignedByte(); timer.remainder = in.readUnsignedByte();
+            if ((timer.control & ~0x37) != 0 || timer.remainder >= 50) throw new IOException("Invalid timer state");
+        }
+    }
+
 }

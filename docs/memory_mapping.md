@@ -16,7 +16,7 @@ NVRAM images and dirty snapshots are exactly 64 KiB. Older 128 KiB images are re
 
 ## Minecraft time and host clock
 
-The clock uses the Minecraft server host's local date and time, including milliseconds. The day counter is `(world day time / 24000) & 0xFFFF`; it advances with Minecraft's daylight cycle and responds to `/time` commands. The tick counter is the low 16 bits of game ticks elapsed since CPU power-on and wraps from `65535` to `0`. The first submitted world game time establishes the origin; before that it is zero. Later positive game-time deltas accumulate, while a backward game-time change does not reduce uptime. CPU-only RESET does not restart this count. Timers use the full accumulated tick count, not its wrapped 16-bit view. These bytes are refreshed at each `beforeInstruction()` boundary from one host-clock sample. Writes to this region do not change them.
+The clock uses the Minecraft server host's local date and time, including milliseconds. The day counter is `(world day time / 24000) & 0xFFFF`; it advances with Minecraft's daylight cycle and responds to `/time` commands. The tick counter is the low 16 bits of game ticks elapsed since CPU power-on and wraps from `65535` to `0`. The first submitted world game time establishes the origin; before that it is zero. Later positive game-time deltas accumulate, while a backward game-time change does not reduce uptime. CPU-only RESET does not restart this count. Timers use the full accumulated tick count, not its wrapped 16-bit view. Day/uptime bytes are refreshed by `CPU8086.beforeTick()` once per host tick. Real-time/calendar bytes are refreshed by `CPU8086.beforeBatch()` from one host-clock sample per executed batch. Neither region is refreshed by `step()` / `beforeInstruction()`. Writes to this region do not change them.
 
 | Address             | Value                                                 | Range                      |
 |---------------------|-------------------------------------------------------|----------------------------|
@@ -31,3 +31,7 @@ The clock uses the Minecraft server host's local date and time, including millis
 | `0x9FFFE`–`0x9FFFF` | Year, unsigned 16-bit, little-endian                  | `0`–`65535`                |
 
 Each byte read is valid on its own. A program reading several fields over multiple instructions can see values from either side of a second, day, or year change; the map does not currently provide an atomic multi-field snapshot.
+
+## Installed hardware
+
+`CPU8086.configureHardware` gates the Atomic Clock, Integrated Storage and Ender Tunnel ranges. An absent device reads as zero and ignores writes, including word accesses and range boundaries. Disabling access does not erase retained NVRAM or shared-region bytes. Configure only on the CPU worker while powered off. Full CPU snapshots retain private memory; the host saves each shared region once.

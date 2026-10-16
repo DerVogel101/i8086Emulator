@@ -1,5 +1,8 @@
 package dervogel101.de.state;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.Objects;
 
 /** Host-persisted storage addressed as 65,536 little-endian words. */
@@ -73,4 +76,15 @@ public final class IoStorageDevice {
             return version;
         }
     }
+
+    public synchronized void writeState(DataOutput out) throws IOException {
+        out.write(bytes); out.writeLong(version); out.writeLong(savedVersion);
+    }
+
+    public synchronized void readState(DataInput in) throws IOException {
+        in.readFully(bytes); version = in.readLong(); savedVersion = in.readLong();
+        if (version < 0 || savedVersion < 0 || savedVersion > version)
+            throw new IOException("Invalid disk versions");
+    }
+
 }
