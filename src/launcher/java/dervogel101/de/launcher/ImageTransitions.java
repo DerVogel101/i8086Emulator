@@ -10,15 +10,15 @@ final class ImageTransitions {
     enum Decision { SAVE, DISCARD, CANCEL }
 
     interface Prompt {
-        Decision decide(LauncherController cpu, Kind kind);
-        Path choosePath(LauncherController cpu, Kind kind);
+        Decision decide(DebuggerBackend cpu, Kind kind);
+        Path choosePath(DebuggerBackend cpu, Kind kind);
     }
 
-    static boolean resolve(List<LauncherController> cpus, boolean nvram, boolean storage, Prompt prompt) {
+    static boolean resolve(List<? extends DebuggerBackend> cpus, boolean nvram, boolean storage, Prompt prompt) {
         List<Runnable> saves = new ArrayList<>();
         List<Runnable> discards = new ArrayList<>();
-        for (LauncherController cpu : cpus) {
-            LauncherController.ImageState state = cpu.inspectImages();
+        for (DebuggerBackend cpu : cpus) {
+            DebuggerBackend.ImageState state = cpu.inspectImages();
             if (nvram && state.nvramDirty()) {
                 Decision decision = prompt.decide(cpu, Kind.NVRAM);
                 if (decision == Decision.CANCEL) return false;

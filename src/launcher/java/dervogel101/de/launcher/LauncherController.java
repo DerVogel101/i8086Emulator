@@ -1,6 +1,14 @@
 package dervogel101.de.launcher;
 
 import dervogel101.de.CPU8086;
+import dervogel101.de.i86.runtime.ShardSpeed;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.HardwareProfile;
+import dervogel101.de.i86.runtime.RedstoneIrqMode;
+import dervogel101.de.state.SharedMemoryGroups;
+import java.nio.charset.Charset;
+import dervogel101.de.i86.runtime.TickBudget;
+import dervogel101.de.i86.runtime.VirtualGameClock;
 import dervogel101.de.CpuHostBridge;
 import dervogel101.de.state.CPUMemory;
 import dervogel101.de.state.CPURegister;
@@ -11,15 +19,22 @@ import javax.swing.SwingUtilities;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Arrays;
+import java.util.Objects;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -28,18 +43,8 @@ import java.util.function.LongSupplier;
 import java.util.function.Consumer;
 
 /** Owns the CPU thread. Swing only receives copied state. */
-final class LauncherController implements AutoCloseable {
-    record Snapshot(String romName, String status, String registers, long instructionsPerSecond,
-                    long totalInstructions,
-                    int memoryBase, byte[] memory, int ioBase, byte[] io,
-                    List<Disassembler8086.Instruction> code, boolean running, boolean faulted,
-            DeviceSnapshot devices, String terminalLog, ImageState images, boolean testHigh) {}
-    record DeviceSnapshot(int channel, int signIndex, int timerIndex, byte[] redstone,
-                          byte[] sign, byte[] timer, byte[] irq, byte[] storage, boolean timerAutomatic) {}
-    record ImageState(Path nvramPath, boolean nvramDirty, Path storagePath,
-                      boolean storageDirty, boolean storageConnected) {}
-
-    private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(r -> {
+final class LauncherController implements DebuggerBackend {
+    private final ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1, r -> {
         Thread thread = new Thread(r, "8086-launcher-cpu");
         thread.setDaemon(true);
         return thread;
@@ -48,7 +53,20 @@ final class LauncherController implements AutoCloseable {
     private final Consumer<String> onError;
     private CPU8086 cpu;
     private SharedMemoryRegion sharedMemory;
+    private SharedMemoryGroups groups;
+    private long mainframeId;
+    private String memoryId = "default";
+    private boolean powered, psuHigh, sharedSelectionRequired, needsColdStart;
+    private boolean shardPresent = true;
+    private int shardTier = 3;
+    private HardwareProfile hardware = HardwareProfile.complete();
     private final LongSupplier worldTime;
+    private final VirtualGameClock ownClock;
+    private final TickBudget tickBudget = new TickBudget();
+    private ScheduledFuture<?> tickTask, batchTask;
+    private long pacingGeneration, pacingTick, tickStart, tickDuration;
+    private ShardSpeed tickSpeed;
+    private Snapshot lastPausedSnapshot;
     private byte[] savedNvram = new byte[CPUMemory.NVRAM_SIZE];
     private Path nvramPath;
     private boolean nvramNew;
@@ -58,6 +76,10 @@ final class LauncherController implements AutoCloseable {
     private boolean storageNew;
     private boolean testHigh;
     private byte[] rom;
+    private Path romPath;
+    private boolean romUnavailable;
+    private BasicFileAttributes checkedRomAttributes;
+    private boolean checkedRomMatches;
     private String romName = "No ROM loaded";
     private String status = "Paused";
     private boolean running;
@@ -68,13 +90,14 @@ final class LauncherController implements AutoCloseable {
     private int targetCs = -1, targetIp;
     private boolean stepOver;
     private int instructionsPerTick = 10_000;
+    private int batchesPerTick = 10;
     private int ticksPerSecond = 20;
     private int memoryBase = 0xFFF00;
     private int ioBase;
     private int codeCs = 0xFFFF, codeIp;
     private boolean followPc = true;
     private int selectedChannel, selectedSign, selectedTimer;
-    private long gameTime, gameNanos, lastTickNanos;
+    private long gameTime;
     private long lastSubmittedGameTime = Long.MIN_VALUE;
     private long rateInstructions, rateStart = System.nanoTime(), measuredRate;
     private long totalInstructions;
@@ -88,37 +111,61 @@ final class LauncherController implements AutoCloseable {
         this.onSnapshot = onSnapshot;
         this.onError = onError;
         this.sharedMemory = sharedMemory;
-        this.worldTime = worldTime;
+        ownClock = worldTime == null ? new VirtualGameClock(20) : null;
+        this.worldTime = worldTime == null ? ownClock::ticks : worldTime;
+        worker.setRemoveOnCancelPolicy(true);
         cpu = new CPU8086(sharedMemory);
         worker.scheduleWithFixedDelay(this::publish, 0, 200, TimeUnit.MILLISECONDS);
     }
 
-    void loadRom(Path path) {
+    LauncherController(Consumer<Snapshot> onSnapshot, Consumer<String> onError,
+                       SharedMemoryGroups groups, long mainframeId, LongSupplier worldTime) {
+        this(onSnapshot, onError, groups.region("default"), worldTime);
+        this.groups = groups;
+        this.mainframeId = mainframeId;
+    }
+
+    public void loadRom(Path path) {
         worker.execute(() -> {
-            pauseInternal();
             try {
+                requirePowerOff();
                 byte[] image = Files.readAllBytes(path);
                 if (image.length != CPUMemory.ROM_SIZE) throw new IllegalArgumentException("ROM must be exactly 256 KiB");
                 CPU8086 next = newCpu();
                 next.hostBridge().loadRom(image);
-                rom = image;
+                checkedRomAttributes = null;
+            rom = image;
+                romPath = path.toAbsolutePath(); romUnavailable = false;
                 cpu = next;
                 romName = path.getFileName().toString();
                 resetView();
+                needsColdStart = false;
                 status = "Paused at reset vector";
+                if (psuHigh && ensurePowered()) start(-1, 0, false);
             } catch (Throwable error) { report(error); }
             publish();
         });
     }
 
-    void configure(int instructions, int ticks) {
-        if (instructions < 1 || ticks < 1 || ticks > 1000) throw new IllegalArgumentException("Positive budget and 1–1000 ticks/s required");
-        worker.execute(() -> { instructionsPerTick = instructions; ticksPerSecond = ticks; publish(); });
+    public void configure(int instructions, int ticks) {
+        configure(instructions, ticks, Math.min(10, instructions));
     }
 
-    void run() { worker.execute(() -> start(-1, 0, false)); }
-    void runTo(int cs, int ip) { worker.execute(() -> start(cs, ip, false)); }
-    void stepOver() {
+    public void configure(int instructions, int ticks, int batches) {
+        new ShardSpeed(instructions, batches);
+        if (ticks < 1 || ticks > 1000) throw new IllegalArgumentException("1–1000 ticks/s required");
+        worker.execute(() -> {
+            instructionsPerTick = instructions;
+            batchesPerTick = batches;
+            ticksPerSecond = ticks;
+            if (ownClock != null) ownClock.setRate(ticks);
+            publish();
+        });
+    }
+
+    public void run() { worker.execute(() -> start(-1, 0, false)); }
+    public void runTo(int cs, int ip) { worker.execute(() -> start(cs, ip, false)); }
+    public void stepOver() {
         worker.execute(() -> {
             if (faulted || rom == null) return;
             CPURegister r = cpu.registers();
@@ -130,6 +177,8 @@ final class LauncherController implements AutoCloseable {
 
     private void start(int cs, int ip, boolean over) {
         if (rom == null || faulted || running) return;
+        psuHigh = true;
+        if (!ensurePowered()) { publish(); return; }
         targetCs = cs;
         targetIp = ip;
         stepOver = over;
@@ -137,33 +186,39 @@ final class LauncherController implements AutoCloseable {
         stopRequested = false;
         running = true;
         status = over ? "Stepping over" : cs >= 0 ? "Running to cursor" : "Running";
-        lastTickNanos = System.nanoTime();
+        updateWorldTime();
+        pacingGeneration++;
         scheduleTick(0);
         publish();
     }
 
-    void pause() {
+    public void pause() {
         stopRequested = true;
         worker.execute(() -> { pauseInternal(); stopRequested = false; publish(); });
     }
     private void pauseInternal() {
+        cancelPacing();
         running = false;
         targetCs = -1;
         stepOver = false;
         status = faulted ? "Error" : cpu.isHalted() ? "Paused (HLT)" : "Paused";
     }
 
-    void step() { worker.execute(this::stepInternal); }
+    public void step() { worker.execute(this::stepInternal); }
     private void stepInternal() {
+        checkRomAvailability();
         if (rom == null || faulted) return;
         pauseInternal();
-        updateWorldTime(System.nanoTime());
+        psuHigh = true;
+        if (!ensurePowered()) { publish(); return; }
+        updateWorldTime();
+        cpu.beforeBatch();
         executeOne();
         if (!faulted && cpu.isHalted()) status = "Paused (HLT)";
         publish();
     }
 
-    void skipInstruction() {
+    public void skipInstruction() {
         worker.execute(() -> {
             if (rom == null) return;
             pauseInternal();
@@ -178,7 +233,7 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void setPc(int cs, int ip) {
+    public void setPc(int cs, int ip) {
         worker.execute(() -> {
             if (rom == null) return;
             pauseInternal();
@@ -190,42 +245,57 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void reset() {
+    public void reset() {
         worker.execute(() -> {
             if (rom == null) return;
             pauseInternal();
-            cpu.hostBridge().submitResetPin(true);
-            cpu.hostBridge().submitResetPin(false);
-            try { cpu.step(); faulted = false; status = "CPU reset"; }
+            try { cpu.reset(); faulted = false; status = "CPU reset"; }
             catch (Throwable error) { report(error); }
             publish();
         });
     }
 
-    void powerCycle() {
+    public void powerCycle() {
         worker.execute(() -> {
-            if (rom == null) return;
-            pauseInternal();
+            checkRomAvailability();
+            if (rom == null || romUnavailable) return;
+            boolean restart = running;
+            powerOffInternal();
             CPU8086 next = newCpu();
             next.hostBridge().loadRom(rom);
             cpu = next;
+            needsColdStart = false;
             resetView();
+            if (psuHigh) ensurePowered();
             status = "Power cycled";
+            if (restart && psuHigh) start(-1, 0, false);
             publish();
         });
     }
 
     private CPU8086 newCpu() {
         CPU8086 next = new CPU8086(sharedMemory);
-        next.hostBridge().loadNvram(savedNvram);
-        if (storage != null) {
-            next.hostBridge().submitStorageDevice(storage);
-            next.beforeInstruction();
+        next.configureHardware(hardware);
+        if (cpu != null) nvramNew |= cpu.hostBridge().snapshotNvramIfDirty() != null;
+        next.hostBridge().loadNvram(cpu == null ? savedNvram : cpu.memory().snapshotNvram().bytes());
+        if (storage != null) next.hostBridge().submitStorageDevice(storage);
+        if (cpu != null) {
+            for (int i = 0; i < 128; i++) {
+                next.hostBridge().submitRedstoneIrqMode(i, cpu.hostBridge().redstoneIrqMode(i));
+                next.hostBridge().submitSignIrqSides(i, cpu.hostBridge().signIrqSides(i));
+                next.hostBridge().submitRedstoneInput(i, cpu.io().read8(i * 2), false);
+            }
+            for (int i = 0; i < 6; i++) next.hostBridge().submitTimerAutomatic(i, cpu.hostBridge().timerAutomatic(i));
         }
+        next.hostBridge().submitTestPin(testHigh);
+        long ticks = worldTime.getAsLong();
+        next.hostBridge().submitWorldTime(ticks, ticks);
+        next.beforeTick();
+        next.beforeBatch();
         return next;
     }
 
-    void pauseAndWait() {
+    public void pauseAndWait() {
         stopRequested = true;
         call(() -> {
             pauseInternal();
@@ -236,13 +306,14 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    ImageState inspectImages() {
+    public ImageState inspectImages() {
         return call(this::imageState);
     }
 
-    void openNvram(Path path) {
+    public void openNvram(Path path) {
         byte[] image = readImage(path, CPUMemory.NVRAM_SIZE);
         call(() -> {
+            requirePowerOff();
             pauseInternal();
             cpu.hostBridge().loadNvram(image);
             savedNvram = image;
@@ -253,8 +324,9 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void newNvram() {
+    public void newNvram() {
         call(() -> {
+            requirePowerOff();
             pauseInternal();
             savedNvram = new byte[CPUMemory.NVRAM_SIZE];
             cpu.hostBridge().loadNvram(savedNvram);
@@ -265,7 +337,7 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void saveNvram(Path path) {
+    public void saveNvram(Path path) {
         call(() -> {
             CPUMemory.NvramSnapshot snapshot = cpu.memory().snapshotNvram();
             byte[] image = snapshot.bytes();
@@ -279,7 +351,7 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void discardNvram() {
+    public void discardNvram() {
         call(() -> {
             pauseInternal();
             cpu.hostBridge().loadNvram(savedNvram);
@@ -289,9 +361,10 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void openStorage(Path path) {
+    public void openStorage(Path path) {
         byte[] image = readImage(path, IoStorageDevice.SIZE);
         call(() -> {
+            requirePowerOff();
             pauseInternal();
             cpu.beforeInstruction();
             storage = new IoStorageDevice();
@@ -305,8 +378,9 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void newStorage() {
+    public void newStorage() {
         call(() -> {
+            requirePowerOff();
             pauseInternal();
             cpu.beforeInstruction();
             storage = new IoStorageDevice();
@@ -319,7 +393,7 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void saveStorage(Path path) {
+    public void saveStorage(Path path) {
         call(() -> {
             if (storage == null) throw new IllegalStateException("Storage is disconnected");
             IoStorageDevice.Snapshot snapshot = storage.snapshot();
@@ -334,7 +408,7 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void discardStorage() {
+    public void discardStorage() {
         call(() -> {
             pauseInternal();
             cpu.beforeInstruction();
@@ -349,8 +423,9 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void disconnectStorage() {
+    public void disconnectStorage() {
         call(() -> {
+            requirePowerOff();
             pauseInternal();
             cpu.beforeInstruction();
             storage = null;
@@ -363,7 +438,8 @@ final class LauncherController implements AutoCloseable {
         });
     }
 
-    void powerCycleWithSharedMemory(SharedMemoryRegion nextRegion) {
+    public void powerCycleWithSharedMemory(SharedMemoryRegion nextRegion) {
+        if (groups != null) throw new IllegalStateException("Managed CPUs use named shared-memory groups");
         call(() -> {
             pauseInternal();
             sharedMemory = nextRegion;
@@ -385,7 +461,7 @@ final class LauncherController implements AutoCloseable {
         return new ImageState(nvramPath,
                 nvramNew || cpu.hostBridge().snapshotNvramIfDirty() != null,
                 storagePath,
-                storage != null && (storageNew || storage.snapshotIfDirty() != null), storage != null);
+                storage != null && (storageNew || storage.snapshotIfDirty() != null), storage != null && hardware.has(Hardware.DISK));
     }
 
     private static byte[] readImage(Path path, int expectedSize) {
@@ -440,62 +516,60 @@ final class LauncherController implements AutoCloseable {
         memoryBase = 0xFFF00;
         ioBase = 0;
         selectedChannel = selectedSign = selectedTimer = 0;
-        gameTime = gameNanos = rateInstructions = measuredRate = totalInstructions = 0;
+        gameTime = rateInstructions = measuredRate = totalInstructions = 0;
         lastSubmittedGameTime = Long.MIN_VALUE;
-        testHigh = false;
         rateStart = System.nanoTime();
     }
 
-    void nmi() { worker.execute(() -> {
-        cpu.hostBridge().submitNmiPin(true);
-        cpu.hostBridge().submitNmiPin(false);
+    public void nmi() { worker.execute(() -> {
+        cpu.hostBridge().submitNmiPulse();
         if (!running) cpu.beforeInstruction();
         publish();
     }); }
 
-    void testPin(boolean high) { worker.execute(() -> {
+    public void testPin(boolean high) { worker.execute(() -> {
         testHigh = high;
         cpu.hostBridge().submitTestPin(high);
         if (!running) cpu.beforeInstruction();
         publish();
     }); }
 
-    void redstone(int channel, int strength) { worker.execute(() -> command(() -> {
+    public void redstone(int channel, int strength) { worker.execute(() -> command(() -> {
         cpu.hostBridge().submitRedstoneInput(channel, strength);
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void signClick(int sign, boolean front) { worker.execute(() -> command(() -> {
+    public void signClick(int sign, boolean front) { worker.execute(() -> command(() -> {
         cpu.hostBridge().submitSignClick(sign, front ? CpuHostBridge.SignSide.FRONT : CpuHostBridge.SignSide.BACK);
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void selectChannel(int channel) { worker.execute(() -> command(() -> {
+    public void selectChannel(int channel) { worker.execute(() -> command(() -> {
         if (channel < 0 || channel >= 128) throw new IllegalArgumentException("Redstone channel: " + channel);
         selectedChannel = channel;
     })); }
 
-    void selectSign(int sign) { worker.execute(() -> command(() -> {
+    public void selectSign(int sign) { worker.execute(() -> command(() -> {
         if (sign < 0 || sign >= 128) throw new IllegalArgumentException("Sign index: " + sign);
         selectedSign = sign;
     })); }
 
-    void selectTimer(int timer) { worker.execute(() -> command(() -> {
+    public void selectTimer(int timer) { worker.execute(() -> command(() -> {
         if (timer < 0 || timer >= 6) throw new IllegalArgumentException("Timer index: " + timer);
         selectedTimer = timer;
     })); }
 
-    void sendIrq(int deviceId) { worker.execute(() -> command(() -> {
+    public void sendIrq(int deviceId) { worker.execute(() -> command(() -> {
         cpu.hostBridge().submitIrq(deviceId);
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void timerAutomatic(int timer, boolean automatic) { worker.execute(() -> command(() -> {
+    public void timerAutomatic(int timer, boolean automatic) { worker.execute(() -> command(() -> {
         cpu.hostBridge().submitTimerAutomatic(timer, automatic);
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void writeTimer(int timer, int reload, int control) { worker.execute(() -> command(() -> {
+    public void writeTimer(int timer, int reload, int control) { worker.execute(() -> command(() -> {
         if (timer < 0 || timer >= 6 || reload < 0 || reload > 0xFFFF || (control & ~0x37) != 0)
             throw new IllegalArgumentException("Timer setting out of range");
         int base = 0x8100 + timer * 8;
@@ -505,35 +579,38 @@ final class LauncherController implements AutoCloseable {
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void resetTimer(int timer) { worker.execute(() -> command(() -> {
+    public void resetTimer(int timer) { worker.execute(() -> command(() -> {
         if (timer < 0 || timer >= 6) throw new IllegalArgumentException("Timer index: " + timer);
         cpu.io().write8(0x8100 + timer * 8 + 4, 8);
         if (!running) cpu.beforeInstruction();
     })); }
 
-    void writeSignLine(int sign, int line, String text) {
-        if (sign < 0 || sign >= 128 || line < 0 || line >= 8 || text.length() > 15 ||
-                !text.chars().allMatch(c -> c >= 0x20 && c <= 0x7E))
-            throw new IllegalArgumentException("Sign text must be at most 15 printable ASCII characters.");
+    private static final Charset WINDOWS_1252 = Charset.forName("windows-1252");
+
+    public void writeSignLine(int sign, int line, String text) {
+        if (sign < 0 || sign >= 128 || line < 0 || line >= 8 || text.length() > 15
+                || !WINDOWS_1252.newEncoder().canEncode(text))
+            throw new IllegalArgumentException("Sign text requires at most 15 Windows-1252 characters");
+        byte[] bytes = text.getBytes(WINDOWS_1252);
         worker.execute(() -> command(() -> {
             int base = 0x0100 + sign * 0x100 + line * 16 + 1;
-            for (int i = 0; i < 15; i++) cpu.io().write8(base + i, i < text.length() ? text.charAt(i) : 0);
+            for (int i = 0; i < 15; i++) cpu.io().write8(base + i, i < bytes.length ? bytes[i] : 0);
         }));
     }
 
-    void memoryBase(int address) { worker.execute(() -> { memoryBase = address & 0xFFFFF; publish(); }); }
-    void ioBase(int port) { worker.execute(() -> { ioBase = port & 0xFFFF; publish(); }); }
-    void codeAddress(int cs, int ip) { worker.execute(() -> {
+    public void memoryBase(int address) { worker.execute(() -> { memoryBase = address & 0xFFFFF; publish(); }); }
+    public void ioBase(int port) { worker.execute(() -> { ioBase = port & 0xFFFF; publish(); }); }
+    public void codeAddress(int cs, int ip) { worker.execute(() -> {
         codeCs = cs & 0xFFFF; codeIp = ip & 0xFFFF; followPc = false; publish();
     }); }
-    void followPc() { worker.execute(() -> { followPc = true; publish(); }); }
+    public void followPc() { worker.execute(() -> { followPc = true; publish(); }); }
 
-    void writeMemory(int address, int value) { worker.execute(() -> command(() -> {
+    public void writeMemory(int address, int value) { worker.execute(() -> command(() -> {
         if (!writableMemory(address)) throw new IllegalArgumentException("Read-only memory address");
         cpu.memory().write8(address >>> 4, address & 15, value);
     })); }
 
-    void writeIo(int port, int value) { worker.execute(() -> command(() -> {
+    public void writeIo(int port, int value) { worker.execute(() -> command(() -> {
         if (!writableIo(port)) throw new IllegalArgumentException("Read-only I/O port");
         cpu.io().write8(port, value);
         if (!running) cpu.beforeInstruction();
@@ -559,55 +636,98 @@ final class LauncherController implements AutoCloseable {
         return port == 0xFF02;
     }
 
-    private void scheduleTick(long delayNanos) {
-        worker.schedule(this::tick, delayNanos, TimeUnit.NANOSECONDS);
+    private void cancelPacing() {
+        pacingGeneration++;
+        tickBudget.stop();
+        if (tickTask != null) tickTask.cancel(false);
+        if (batchTask != null) batchTask.cancel(false);
+        tickTask = batchTask = null;
     }
 
-    private void tick() {
-        if (!running) return;
-        long begin = System.nanoTime();
-        updateWorldTime(begin);
-        int completed = 0, attempts = 0;
-        while (running && !stopRequested && completed < instructionsPerTick && attempts++ < instructionsPerTick + 1024) {
+    private void scheduleTick(long delayNanos) {
+        long generation = pacingGeneration;
+        tickTask = worker.schedule(() -> tick(generation), delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void tick(long generation) {
+        checkRomAvailability();
+        if (!running || generation != pacingGeneration) return;
+        if (stopRequested) {
+            pauseInternal();
+            publish();
+            return;
+        }
+        tickStart = System.nanoTime();
+        tickDuration = 1_000_000_000L / ticksPerSecond;
+        tickSpeed = new ShardSpeed(instructionsPerTick, batchesPerTick);
+        tickBudget.begin(tickStart, tickDuration, tickSpeed);
+        long tick = ++pacingTick;
+        updateWorldTime();
+        scheduleTick(tickDuration);
+        runBatch(generation, tick);
+    }
+
+    private void runBatch(long generation, long tick) {
+        if (!running || generation != pacingGeneration || tick != pacingTick) return;
+        TickBudget.Batch batch = tickBudget.take(System.nanoTime());
+        if (batch == null) return;
+        cpu.beforeBatch();
+        boolean tickYield = false;
+        for (int remaining = batch.steps(); running && !stopRequested
+                && remaining > 0 && tickBudget.valid(batch, System.nanoTime()); remaining--) {
             CPURegister r = cpu.registers();
             if (targetCs >= 0 && r.getCs() == targetCs && r.getIp() == targetIp) {
                 boolean over = stepOver;
-                pauseInternal(); status = over ? "Step over complete" : "Cursor reached"; break;
+                pauseInternal();
+                status = over ? "Step over complete" : "Cursor reached";
+                break;
             }
             if (cpu.memory().read8(r.getCs(), r.getIp()) == 0xCC && !bypassInt3Once && !cpu.isHalted()) {
-                pauseInternal(); status = "INT 3 breakpoint"; break;
+                pauseInternal();
+                status = "INT 3 breakpoint";
+                break;
             }
             bypassInt3Once = false;
             CPU8086.StepOutcome result = executeOne();
             if (faulted) break;
-            if (result == CPU8086.StepOutcome.INSTRUCTION) completed++;
-            if (result == CPU8086.StepOutcome.IDLE) {
-                if (targetCs >= 0) { pauseInternal(); status = "Temporary run stopped at HLT/WAIT"; }
-                else status = cpu.isHalted() ? "Waiting (HLT)" : "Waiting";
+            if (result != CPU8086.StepOutcome.IDLE) {
+                status = stepOver ? "Stepping over" : targetCs >= 0 ? "Running to cursor" : "Running";
+            }
+            if (result == CPU8086.StepOutcome.YIELD_BATCH || result == CPU8086.StepOutcome.YIELD_TICK) {
+                tickYield = result == CPU8086.StepOutcome.YIELD_TICK;
+                tickBudget.yielded(batch, tickYield ? TickBudget.Outcome.YIELD_TICK : TickBudget.Outcome.YIELD_BATCH);
                 break;
+            }
+            if (result == CPU8086.StepOutcome.IDLE) {
+                if (targetCs >= 0) {
+                    pauseInternal();
+                    status = "Temporary run stopped at HLT/WAIT";
+                    break;
+                }
+                status = cpu.isHalted() ? "Waiting (HLT)" : "Waiting";
             }
         }
         if (stopRequested) pauseInternal();
         publish();
-        if (running) scheduleTick(Math.max(0, 1_000_000_000L / ticksPerSecond - (System.nanoTime() - begin)));
+        if (!running || tickYield || generation != pacingGeneration || tick != pacingTick) return;
+        long now = System.nanoTime();
+        long elapsed = now - tickStart;
+        if (elapsed >= tickDuration) return;
+        int next = Math.max(batch.index() + 1,
+                (int) (elapsed * tickSpeed.batchesPerTick() / tickDuration));
+        if (next < tickSpeed.batchesPerTick()) {
+            long when = tickStart + tickDuration * next / tickSpeed.batchesPerTick();
+            batchTask = worker.schedule(() -> runBatch(generation, tick), Math.max(0, when - now),
+                    TimeUnit.NANOSECONDS);
+        }
     }
 
-    private void updateWorldTime(long now) {
-        if (worldTime != null) {
-            gameTime = worldTime.getAsLong();
-            if (gameTime != lastSubmittedGameTime) {
-                cpu.hostBridge().submitWorldTime(gameTime, gameTime);
-                lastSubmittedGameTime = gameTime;
-            }
-            return;
-        }
-        gameNanos += Math.max(0, now - lastTickNanos);
-        lastTickNanos = now;
-        long delta = gameNanos / 50_000_000L;
-        gameNanos %= 50_000_000L;
-        if (delta > 0) {
-            gameTime += delta;
+    private void updateWorldTime() {
+        gameTime = worldTime.getAsLong();
+        if (gameTime != lastSubmittedGameTime) {
             cpu.hostBridge().submitWorldTime(gameTime, gameTime);
+        cpu.beforeTick();
+            lastSubmittedGameTime = gameTime;
         }
     }
 
@@ -616,7 +736,8 @@ final class LauncherController implements AutoCloseable {
         int cs = r.getCs(), ip = r.getIp();
         try {
             CPU8086.StepOutcome result = cpu.step();
-            if (result == CPU8086.StepOutcome.INSTRUCTION) { rateInstructions++; totalInstructions++; }
+            if (result == CPU8086.StepOutcome.INSTRUCTION || result == CPU8086.StepOutcome.YIELD_BATCH
+                    || result == CPU8086.StepOutcome.YIELD_TICK) { rateInstructions++; totalInstructions++; }
             return result;
         } catch (Throwable error) {
             faulted = true;
@@ -630,18 +751,28 @@ final class LauncherController implements AutoCloseable {
     }
 
     private void report(Throwable error) {
+        cpu.hostBridge().reportHostError(error.toString() + "\n");
         StringWriter output = new StringWriter();
         error.printStackTrace(new PrintWriter(output));
         SwingUtilities.invokeLater(() -> onError.accept(output.toString()));
     }
 
     private void publish() {
+        checkRomAvailability();
         try {
             long now = System.nanoTime(), elapsed = now - rateStart;
             if (elapsed >= 1_000_000_000L) {
                 measuredRate = rateInstructions * 1_000_000_000L / elapsed;
                 rateInstructions = 0;
                 rateStart = now;
+            }
+            if (running && lastPausedSnapshot != null) {
+                Snapshot previous = lastPausedSnapshot;
+                Snapshot snapshot = new Snapshot(romName, status, previous.registers(), measuredRate, totalInstructions,
+                        previous.memoryBase(), previous.memory(), previous.ioBase(), previous.io(), previous.code(),
+                        true, faulted, previous.devices(), cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
+                SwingUtilities.invokeLater(() -> onSnapshot.accept(snapshot));
+                return;
             }
             CPURegister r = cpu.registers();
             int cs = followPc ? r.getCs() : codeCs, ip = followPc ? r.getIp() : codeIp;
@@ -657,7 +788,8 @@ final class LauncherController implements AutoCloseable {
         byte[] irq = readPorts(0xFF00, 3);
         byte[] storagePorts = readPorts(0x8160, 5);
         DeviceSnapshot devices = new DeviceSnapshot(selectedChannel, selectedSign, selectedTimer,
-                redstone, sign, timer, irq, storagePorts, cpu.hostBridge().timerAutomatic(selectedTimer));
+                redstone, sign, timer, irq, storagePorts, cpu.hostBridge().timerAutomatic(selectedTimer), cpu.hostBridge().redstoneIrqMode(selectedChannel),
+                    cpu.hostBridge().signIrqSides(selectedSign));
             List<Disassembler8086.Instruction> code = new ArrayList<>();
             if (rom != null) for (int i = 0; i < 25; i++) {
                 var ins = Disassembler8086.decode(cpu.memory(), cs, ip);
@@ -666,7 +798,8 @@ final class LauncherController implements AutoCloseable {
             }
         Snapshot snapshot = new Snapshot(romName, status, registerText(r), measuredRate, totalInstructions,
                 memoryBase, memory, ioBase, io, List.copyOf(code), running, faulted, devices,
-                cpu.hostBridge().terminalText(), imageState(), testHigh);
+                cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
+            lastPausedSnapshot = snapshot;
             SwingUtilities.invokeLater(() -> onSnapshot.accept(snapshot));
         } catch (Throwable error) { report(error); }
     }
@@ -690,5 +823,207 @@ final class LauncherController implements AutoCloseable {
 
     private static int bit(boolean value) { return value ? 1 : 0; }
 
-    @Override public void close() { worker.shutdownNow(); }
+    @Override public synchronized void close() {
+        if (worker.isShutdown()) return;
+        stopRequested = true;
+        worker.execute(this::powerOffInternal);
+        worker.shutdown();
+    }
+
+    private MachineState machineState() {
+        return new MachineState(powered, psuHigh, hardware, shardTier, memoryId,
+                new ShardSpeed(instructionsPerTick, batchesPerTick));
+    }
+
+    public MachineState inspectMachine() { return call(this::machineState); }
+
+    private void requirePowerOff() {
+        if (powered) throw new IllegalStateException("Power off the mainframe before changing installed hardware or images");
+    }
+
+    private void powerOffInternal() {
+        pauseInternal();
+        if (powered) {
+            needsColdStart = true;
+            if (groups != null) groups.powerOff(mainframeId);
+        }
+        powered = false;
+    }
+
+    private boolean ensurePowered() {
+        if (powered) return true;
+        if (rom == null || romUnavailable || !shardPresent || sharedSelectionRequired) {
+            status = "Powered off: " + (rom == null ? "no ROM" : romUnavailable ? "ROM missing or invalid" : !shardPresent ? "no speed shard" : "select a shared-memory ID");
+            return false;
+        }
+        if (groups != null && hardware.has(Hardware.SHARED_MEMORY)) sharedMemory = groups.powerOn(mainframeId, memoryId);
+        if (needsColdStart) {
+            cpu = newCpu(); cpu.hostBridge().loadRom(rom); resetView(); needsColdStart = false;
+        }
+        powered = true;
+        return true;
+    }
+
+    public void powerSupply(boolean high) {
+        call(() -> {
+            psuHigh = high;
+            if (!high) { powerOffInternal(); status = "Powered off"; }
+            else if (!powered && ensurePowered()) start(-1, 0, false);
+            publish(); return null;
+        });
+    }
+
+    public void configureMachine(HardwareProfile profile, boolean crystal, String sharedId) {
+        configureMachine(profile, crystal ? 3 : 0, sharedId);
+    }
+
+    public void configureMachine(HardwareProfile profile, int tier, String sharedId) {
+        if (tier < 0 || tier > 3) throw new IllegalArgumentException("Speed shard tier must be 0 to 3");
+        String normalized = SharedMemoryGroups.normalize(sharedId);
+        profile.validationError().ifPresent(error -> { throw new IllegalArgumentException(error); });
+        call(() -> {
+            requirePowerOff();
+            hardware = profile; shardTier = tier; shardPresent = tier != 0; memoryId = normalized; sharedSelectionRequired = false;
+            if (groups != null) sharedMemory = groups.region(memoryId);
+            needsColdStart = true;
+            cpu.configureHardware(hardware);
+            if (psuHigh && ensurePowered()) start(-1, 0, false);
+            publish(); return null;
+        });
+    }
+
+    public void sharedRegionDeleted(String id) {
+        call(() -> {
+            if (memoryId.equals(SharedMemoryGroups.normalize(id)) && hardware.has(Hardware.SHARED_MEMORY)) {
+                powerOffInternal(); sharedSelectionRequired = true;
+                status = "Powered off: shared-memory region deleted; select an ID";
+            }
+            publish(); return null;
+        });
+    }
+
+    public void redstoneIrq(int channel, RedstoneIrqMode mode) {
+        worker.execute(() -> command(() -> { cpu.hostBridge().submitRedstoneIrqMode(channel, mode); cpu.beforeInstruction(); }));
+    }
+
+    public void signIrq(int sign, int sides) {
+        worker.execute(() -> command(() -> { cpu.hostBridge().submitSignIrqSides(sign, sides); cpu.beforeInstruction(); }));
+    }
+
+    public boolean powerOffForCycle() {
+        return call(() -> { boolean restart = running; powerOffInternal(); return restart; });
+    }
+
+    public void powerOnAfterCycle(boolean restart) {
+        call(() -> {
+            if (psuHigh) ensurePowered();
+            status = "Power cycled";
+            if (restart && psuHigh) start(-1, 0, false);
+            publish(); return null;
+        });
+    }
+
+    public byte[] saveSessionState(boolean resume) {
+        return call(() -> {
+            if (running) throw new IllegalStateException("Suspend all CPUs before saving a session");
+            updateWorldTime();
+            var buffer = new ByteArrayOutputStream();
+            try (var out = new DataOutputStream(buffer)) {
+                out.writeInt(2); out.writeBoolean(rom != null); out.writeUTF(romName);
+                out.writeUTF(romPath == null ? "" : romPath.toString()); out.writeBoolean(romUnavailable);
+                out.writeBoolean(powered); out.writeBoolean(psuHigh); out.writeBoolean(resume);
+                out.writeBoolean(faulted); out.writeShort(faultCs); out.writeShort(faultIp); out.writeUTF(status);
+                out.writeByte(shardTier); out.writeUTF(memoryId); out.writeBoolean(sharedSelectionRequired);
+                out.writeBoolean(needsColdStart); out.writeBoolean(testHigh);
+                out.writeInt(instructionsPerTick); out.writeInt(batchesPerTick); out.writeInt(ticksPerSecond);
+                out.writeLong(totalInstructions); out.writeBoolean(nvramNew); out.writeBoolean(storageNew);
+                out.writeUTF(nvramPath == null ? "" : nvramPath.toString());
+                out.writeUTF(storagePath == null ? "" : storagePath.toString());
+                out.write(savedNvram); out.writeBoolean(savedStorage != null);
+                if (savedStorage != null) out.write(savedStorage);
+                byte[] core = cpu.saveState(); out.writeInt(core.length); out.write(core);
+            }
+            return buffer.toByteArray();
+        });
+    }
+
+    public boolean restoreSessionState(byte[] saved) {
+        return call(() -> {
+            requirePowerOff();
+            if (saved.length > 4 * 1024 * 1024) throw new IOException("Launcher CPU state exceeds 4 MiB");
+            try (var in = new DataInputStream(new ByteArrayInputStream(saved))) {
+                int version = in.readInt();
+                if (version < 1 || version > 2) throw new IOException("Unsupported launcher CPU state format");
+                boolean hasRom = in.readBoolean(); romName = in.readUTF();
+                String romFile = in.readUTF(); romPath = romFile.isEmpty() ? null : Path.of(romFile);
+                romUnavailable = in.readBoolean();
+                if (hasRom && romPath == null) throw new IOException("Missing ROM reference");
+                boolean savedPowered = in.readBoolean(); psuHigh = in.readBoolean(); boolean resume = in.readBoolean();
+                faulted = in.readBoolean(); faultCs = in.readUnsignedShort(); faultIp = in.readUnsignedShort(); status = in.readUTF();
+                shardTier = version == 1 ? (in.readBoolean() ? 3 : 0) : in.readUnsignedByte();
+                if (shardTier > 3) throw new IOException("Invalid speed shard tier");
+                shardPresent = shardTier != 0; memoryId = SharedMemoryGroups.normalize(in.readUTF()); sharedSelectionRequired = in.readBoolean();
+                needsColdStart = in.readBoolean(); testHigh = in.readBoolean();
+                instructionsPerTick = in.readInt(); batchesPerTick = in.readInt(); ticksPerSecond = in.readInt();
+                new ShardSpeed(instructionsPerTick, batchesPerTick);
+                if (ticksPerSecond < 1 || ticksPerSecond > 1000) throw new IOException("Invalid tick rate");
+                totalInstructions = in.readLong(); nvramNew = in.readBoolean(); storageNew = in.readBoolean();
+                String nvramFile = in.readUTF(), storageFile = in.readUTF();
+                nvramPath = nvramFile.isEmpty() ? null : Path.of(nvramFile);
+                storagePath = storageFile.isEmpty() ? null : Path.of(storageFile);
+                savedNvram = new byte[CPUMemory.NVRAM_SIZE]; in.readFully(savedNvram);
+                savedStorage = in.readBoolean() ? new byte[IoStorageDevice.SIZE] : null;
+                if (savedStorage != null) in.readFully(savedStorage);
+                int length = in.readInt();
+                if (length < 1 || length > 2 * 1024 * 1024) throw new IOException("Invalid core-state length");
+                byte[] core = new byte[length]; in.readFully(core);
+                if (in.read() != -1 || totalInstructions < 0) throw new IOException("Invalid launcher CPU state");
+                sharedMemory = groups == null ? sharedMemory : groups.region(memoryId);
+                cpu = CPU8086.restoreState(core, sharedMemory); hardware = cpu.hardware();
+                rom = hasRom ? cpu.memory().romImage() : null;
+                checkedRomAttributes = null; storage = cpu.io().storageDevice();
+                if (savedPowered && (rom == null || romUnavailable || !psuHigh || !shardPresent || sharedSelectionRequired)
+                        || resume && (!savedPowered || faulted)) throw new IOException("Inconsistent power state");
+                if (storage != null && savedStorage == null) throw new IOException("Missing storage baseline");
+                powered = savedPowered;
+                if (powered && groups != null && hardware.has(Hardware.SHARED_MEMORY)) groups.powerOn(mainframeId, memoryId);
+                running = false; lastPausedSnapshot = null; lastSubmittedGameTime = Long.MIN_VALUE;
+                followPc = true; publish(); return resume;
+            }
+        });
+    }
+
+    public boolean suspendForSession() {
+        return call(() -> { boolean resume = running; pauseInternal(); return resume; });
+    }
+
+    private void checkRomAvailability() {
+        if (rom == null || romPath == null) return;
+        boolean usable;
+        try {
+            var attributes = Files.readAttributes(romPath, BasicFileAttributes.class);
+            usable = attributes.isRegularFile() && attributes.size() == CPUMemory.ROM_SIZE;
+            if (usable) {
+                if (checkedRomAttributes == null
+                        || !attributes.lastModifiedTime().equals(checkedRomAttributes.lastModifiedTime())
+                        || !attributes.creationTime().equals(checkedRomAttributes.creationTime())
+                        || !Objects.equals(attributes.fileKey(), checkedRomAttributes.fileKey())) {
+                    try (var input = Files.newInputStream(romPath)) {
+                        checkedRomMatches = Arrays.equals(rom, input.readNBytes(CPUMemory.ROM_SIZE + 1));
+                    }
+                    checkedRomAttributes = attributes;
+                }
+                usable = checkedRomMatches;
+            }
+        }
+        catch (IOException error) { usable = false; }
+        if (!usable && (powered || !romUnavailable)) {
+            powerOffInternal(); romUnavailable = true;
+            status = "Powered off: ROM missing or invalid — " + romPath;
+            report(new IllegalStateException(status));
+        } else if (usable && romUnavailable) {
+            romUnavailable = false;
+            if (psuHigh && ensurePowered()) start(-1, 0, false);
+        }
+    }
 }

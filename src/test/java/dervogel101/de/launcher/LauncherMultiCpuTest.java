@@ -58,6 +58,7 @@ class LauncherMultiCpuTest {
 
             first.writeMemory(0xA0000, 0x5A);
             first.pauseAndWait();
+            first.powerSupply(false);
             first.newStorage();
             assertTrue(first.inspectImages().storageConnected());
             assertFalse(second.inspectImages().storageConnected());
@@ -143,22 +144,22 @@ class LauncherMultiCpuTest {
             cpu.newNvram();
             cpu.newStorage();
             assertFalse(ImageTransitions.resolve(List.of(cpu), true, true, new ImageTransitions.Prompt() {
-                @Override public ImageTransitions.Decision decide(LauncherController ignored, ImageTransitions.Kind kind) {
+                @Override public ImageTransitions.Decision decide(DebuggerBackend ignored, ImageTransitions.Kind kind) {
                     return kind == ImageTransitions.Kind.NVRAM
                             ? ImageTransitions.Decision.DISCARD : ImageTransitions.Decision.CANCEL;
                 }
-                @Override public Path choosePath(LauncherController ignored, ImageTransitions.Kind kind) { return null; }
+                @Override public Path choosePath(DebuggerBackend ignored, ImageTransitions.Kind kind) { return null; }
             }));
             assertTrue(cpu.inspectImages().nvramDirty());
             assertTrue(cpu.inspectImages().storageDirty());
 
             assertThrows(RuntimeException.class, () -> ImageTransitions.resolve(List.of(cpu), true, true,
                     new ImageTransitions.Prompt() {
-                        @Override public ImageTransitions.Decision decide(LauncherController ignored, ImageTransitions.Kind kind) {
+                        @Override public ImageTransitions.Decision decide(DebuggerBackend ignored, ImageTransitions.Kind kind) {
                             return kind == ImageTransitions.Kind.NVRAM
                                     ? ImageTransitions.Decision.DISCARD : ImageTransitions.Decision.SAVE;
                         }
-                        @Override public Path choosePath(LauncherController ignored, ImageTransitions.Kind kind) {
+                        @Override public Path choosePath(DebuggerBackend ignored, ImageTransitions.Kind kind) {
                             return directory.resolve("missing/storage.img");
                         }
                     }));
@@ -182,10 +183,10 @@ class LauncherMultiCpuTest {
 
     private ImageTransitions.Prompt prompt(ImageTransitions.Decision decision) {
         return new ImageTransitions.Prompt() {
-            @Override public ImageTransitions.Decision decide(LauncherController cpu, ImageTransitions.Kind kind) {
+            @Override public ImageTransitions.Decision decide(DebuggerBackend cpu, ImageTransitions.Kind kind) {
                 return decision;
             }
-            @Override public Path choosePath(LauncherController cpu, ImageTransitions.Kind kind) {
+            @Override public Path choosePath(DebuggerBackend cpu, ImageTransitions.Kind kind) {
                 return directory.resolve(kind + ".img");
             }
         };

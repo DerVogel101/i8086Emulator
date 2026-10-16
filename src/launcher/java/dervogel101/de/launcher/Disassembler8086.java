@@ -60,7 +60,13 @@ public final class Disassembler8086 {
         int modrm;
         int ext;
 
-        if (op < 0x40 && (op & 7) <= 5) {
+        if (op == 0x0F) {
+            if (!prefix.isEmpty() || !segment.isEmpty()) return db(memory, cs, ip);
+            int mode = c.u8();
+            name = "YIELD";
+            args = Integer.toString(mode);
+            unsupported = mode > 1;
+        } else if (op < 0x40 && (op & 7) <= 5) {
             name = ALU[op >>> 3];
             width = (op & 1) == 0 ? 8 : 16;
             if ((op & 7) < 4) {

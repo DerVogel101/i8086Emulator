@@ -6,8 +6,11 @@ plugins {
 sourceSets.main { java.srcDir("../emulator_i86_crafted/src/runtime/java") }
 
 val launcher by sourceSets.creating {
+    java.srcDir("../emulator_i86_crafted/src/debugger/java")
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += output + compileClasspath
+    resources.srcDir("../emulator_i86_crafted/src/main/resources")
+    resources.include("assets/emulator_i86_crafted/font/*")
 }
 
 configurations[launcher.implementationConfigurationName].extendsFrom(configurations.implementation.get())

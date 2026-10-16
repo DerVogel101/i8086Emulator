@@ -7,13 +7,13 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class Disassembler8086Test {
     @Test
-    void recognizesTheDocumented8086OpcodeMap() {
+    void recognizesTheSupported8086OpcodeMapAndYieldExtension() {
         CPUMemory memory = new CPUMemory();
         byte[] rom = new byte[CPUMemory.ROM_SIZE];
         for (int opcode = 0; opcode < 256; opcode++) {
             rom[0] = (byte) opcode;
             memory.loadRom(rom);
-            boolean defined = opcode <= 0x5F && opcode != 0x0F
+            boolean defined = opcode <= 0x5F
                     || opcode >= 0x70 && opcode <= 0x81
                     || opcode >= 0x83 && opcode <= 0xBF
                     || opcode >= 0xC2 && opcode <= 0xC7

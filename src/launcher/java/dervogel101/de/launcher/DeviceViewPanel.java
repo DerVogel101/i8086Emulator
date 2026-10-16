@@ -1,20 +1,24 @@
 package dervogel101.de.launcher;
 
 import javax.swing.*;
+import dervogel101.de.i86.runtime.RedstoneIrqMode;
+import java.nio.charset.Charset;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import java.awt.*;
 import java.util.Arrays;
 import java.util.function.Supplier;
 
-/** Labeled controls for the existing port map. CPU access stays in LauncherController. */
+/** Labeled controls for the existing port map. CPU access stays in DebuggerBackend. */
 final class DeviceViewPanel extends JTabbedPane {
-    private final Supplier<LauncherController> controller;
+    private final Supplier<DebuggerBackend> controller;
     private final Runnable openStorage, newStorage, saveStorage, saveStorageAs, disconnectStorage;
     private final JLabel storageStatus = new JLabel("Disconnected");
     private final JLabel storageRegisters = new JLabel("Data: 0000  Address: 0000  Control: 00");
     private final JSpinner channel = new JSpinner(new SpinnerNumberModel(0, 0, 127, 1));
     private final JSpinner strength = new JSpinner(new SpinnerNumberModel(0, 0, 15, 1));
+    private final JComboBox<RedstoneIrqMode> redstoneIrq = new JComboBox<>(RedstoneIrqMode.values());
+    private final JCheckBox frontIrq = new JCheckBox("Front click IRQ"), backIrq = new JCheckBox("Back click IRQ");
     private final JLabel output = new JLabel("Output: 0");
     private final JSpinner sign = new JSpinner(new SpinnerNumberModel(0, 0, 127, 1));
     private final JTextField[] signLines = new JTextField[8];
@@ -34,10 +38,11 @@ final class DeviceViewPanel extends JTabbedPane {
     private final boolean[] signDirty = new boolean[8];
     private boolean syncing;
     private boolean loaded;
+    private final java.util.List<JButton> mutationButtons = new java.util.ArrayList<>();
     private boolean timerDirty;
     private int displayedChannel = -1, displayedSign = -1, displayedTimer = -1;
 
-    DeviceViewPanel(Supplier<LauncherController> controller, Runnable openStorage, Runnable newStorage,
+    DeviceViewPanel(Supplier<DebuggerBackend> controller, Runnable openStorage, Runnable newStorage,
                     Runnable saveStorage, Runnable saveStorageAs, Runnable disconnectStorage) {
         this.controller = controller;
         this.openStorage = openStorage;
@@ -85,6 +90,10 @@ final class DeviceViewPanel extends JTabbedPane {
         channel.addChangeListener(e -> { if (!syncing) controller.get().selectChannel((Integer) channel.getValue()); });
         panel.add(row(new JLabel("Channel (0–127)"), channel, new JLabel("Input strength (0–15)"), strength,
                 button("Set input", () -> controller.get().redstone((Integer) channel.getValue(), (Integer) strength.getValue()))));
+        redstoneIrq.addActionListener(e -> {
+            if (!syncing) controller.get().redstoneIrq((Integer) channel.getValue(), (RedstoneIrqMode) redstoneIrq.getSelectedItem());
+        });
+        panel.add(row(new JLabel("Input IRQ"), redstoneIrq));
         panel.add(row(output, button("Send IRQ", () -> controller.get().sendIrq((Integer) channel.getValue()))));
         panel.add(row(new JLabel("IRQ ID = channel number; output is written by the ROM.")));
         return panel;
@@ -97,10 +106,17 @@ final class DeviceViewPanel extends JTabbedPane {
                 button("Front click", () -> controller.get().signClick((Integer) sign.getValue(), true)),
                 button("Back click", () -> controller.get().signClick((Integer) sign.getValue(), false)),
                 button("Send IRQ", () -> controller.get().sendIrq(0x0100 | (Integer) sign.getValue()))));
+        Runnable clickIrqs = () -> {
+            if (!syncing) controller.get().signIrq((Integer) sign.getValue(), (frontIrq.isSelected() ? 1 : 0) | (backIrq.isSelected() ? 2 : 0));
+        };
+        frontIrq.addActionListener(e -> clickIrqs.run());
+        backIrq.addActionListener(e -> clickIrqs.run());
+        panel.add(row(frontIrq, backIrq));
         for (int i = 0; i < signLines.length; i++) {
             int line = i;
             signLabels[i] = new JLabel((i < 4 ? "Front " + (i + 1) : "Back " + (i - 3)) + " (format 00)");
             signLines[i] = new JTextField(18);
+            signLines[i].setFont(signFont());
             signLines[i].getDocument().addDocumentListener(new DocumentListener() {
                 private void changed() { if (!syncing) signDirty[line] = true; }
                 @Override public void insertUpdate(DocumentEvent e) { changed(); }
@@ -112,7 +128,7 @@ final class DeviceViewPanel extends JTabbedPane {
         panel.add(row(signControl, button("Reload text", () -> {
             Arrays.fill(signDirty, false);
             controller.get().selectSign((Integer) sign.getValue());
-        }), new JLabel("Text: up to 15 printable ASCII characters per line.")));
+        }), new JLabel("Text: up to 15 Windows-1252 characters per line.")));
         JPanel outer = new JPanel(new BorderLayout());
         outer.add(new JScrollPane(panel), BorderLayout.CENTER);
         return outer;
@@ -164,10 +180,21 @@ final class DeviceViewPanel extends JTabbedPane {
         return panel;
     }
 
-    void update(LauncherController.DeviceSnapshot devices, LauncherController.ImageState images, boolean loaded) {
+    void update(DebuggerBackend.DeviceSnapshot devices, DebuggerBackend.ImageState images, boolean loaded) {
+        if (controller.get().remote()) loaded &= controller.get().canEdit();
         this.loaded = loaded;
+        if (controller.get().remote()) {
+            for (JButton button : mutationButtons) button.setEnabled(loaded);
+            strength.setEnabled(false); redstoneIrq.setEnabled(loaded);
+            frontIrq.setEnabled(loaded); backIrq.setEnabled(loaded);
+            for (JTextField line : signLines) line.setEditable(loaded);
+            for (JComponent field : new JComponent[]{reload, enabled, periodic, irqEnabled, resolution, timerMode, rawId}) field.setEnabled(loaded);
+        }
         syncing = true;
         try {
+            redstoneIrq.setSelectedItem(devices.redstoneIrq());
+            frontIrq.setSelected((devices.signIrqSides() & 1) != 0);
+            backIrq.setSelected((devices.signIrqSides() & 2) != 0);
             channel.setValue(devices.channel());
             sign.setValue(devices.signIndex());
             timer.setValue(devices.timerIndex());
@@ -223,13 +250,9 @@ final class DeviceViewPanel extends JTabbedPane {
     static int timerId(int timer) { return ((timer < 3 ? 2 : 3) << 8) | (timer % 3); }
 
     static String signText(byte[] sign, int line) {
-        StringBuilder text = new StringBuilder();
-        for (int i = line * 16 + 1; i < line * 16 + 16; i++) {
-            int value = Byte.toUnsignedInt(sign[i]);
-            if (value == 0) break;
-            text.append(value >= 0x20 && value <= 0x7E ? Character.toString((char) value) : "\\x%02X".formatted(value));
-        }
-        return text.toString();
+        int start = line * 16 + 1, end = start;
+        while (end < start + 15 && sign[end] != 0) end++;
+        return new String(sign, start, end - start, Charset.forName("windows-1252"));
     }
 
     private static int word(byte[] bytes, int offset) {
@@ -238,7 +261,11 @@ final class DeviceViewPanel extends JTabbedPane {
 
     private JButton button(String label, Runnable action) {
         JButton button = new JButton(label);
-        button.addActionListener(e -> { if (loaded) action.run(); });
+        boolean reload = label.startsWith("Reload");
+        boolean localOnly = controller.get().remote() && java.util.Set.of("Open", "New", "Save", "Save As", "Disconnect", "Set input", "Front click", "Back click").contains(label);
+        if (!reload && !localOnly) mutationButtons.add(button);
+        button.setVisible(!localOnly); button.setEnabled(!localOnly);
+        button.addActionListener(e -> { if (loaded || reload && controller.get().remote()) action.run(); });
         return button;
     }
 
@@ -254,5 +281,14 @@ final class DeviceViewPanel extends JTabbedPane {
         panel.setAlignmentX(Component.LEFT_ALIGNMENT);
         panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, panel.getPreferredSize().height));
         return panel;
+    }
+
+    static Font signFont() {
+        try (var input = DeviceViewPanel.class.getResourceAsStream("/assets/emulator_i86_crafted/font/monosign.ttf")) {
+            if (input == null) throw new IllegalStateException("Bundled sign font is missing");
+            return Font.createFont(Font.TRUETYPE_FONT, input).deriveFont(18f);
+        } catch (java.io.IOException | FontFormatException error) {
+            throw new IllegalStateException("Cannot load bundled sign font", error);
+        }
     }
 }

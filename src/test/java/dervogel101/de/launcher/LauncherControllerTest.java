@@ -87,7 +87,7 @@ class LauncherControllerTest {
             await(snapshots, s -> s.status().equals("Power cycled"));
             controller.memoryBase(0xA0000);
             var clean = await(snapshots, s -> s.status().equals("Power cycled") && s.memoryBase() == 0xA0000);
-            assertEquals(0, Byte.toUnsignedInt(clean.memory()[0]));
+            assertEquals(0x5A, Byte.toUnsignedInt(clean.memory()[0]));
         }
     }
 
@@ -160,7 +160,7 @@ class LauncherControllerTest {
             controller.writeSignLine(1, 0, "HI");
             var sign = await(snapshots, s -> s.devices().signIndex() == 1 && s.devices().sign()[1] == 'H');
             assertEquals("HI", DeviceViewPanel.signText(sign.devices().sign(), 0));
-            assertThrows(IllegalArgumentException.class, () -> controller.writeSignLine(1, 0, "non-ASCII ä"));
+            assertThrows(IllegalArgumentException.class, () -> controller.writeSignLine(1, 0, "unsupported 😀"));
 
             controller.selectTimer(5);
             controller.writeTimer(5, 0x1234, 0x35);

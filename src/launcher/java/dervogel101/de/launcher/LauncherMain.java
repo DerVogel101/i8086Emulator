@@ -1,6 +1,11 @@
 package dervogel101.de.launcher;
 
-import dervogel101.de.state.SharedMemoryRegion;
+import dervogel101.de.state.SharedMemoryGroups;
+import dervogel101.de.i86.runtime.Hardware;
+import dervogel101.de.i86.runtime.ShardSpeed;
+import dervogel101.de.i86.runtime.HardwareProfile;
+import java.util.EnumMap;
+import dervogel101.de.i86.runtime.VirtualGameClock;
 
 
 import javax.swing.*;
@@ -34,15 +39,22 @@ public final class LauncherMain {
     private final JComboBox<CpuSlot> cpuSelector = new JComboBox<>();
     private final JLabel nvramStatus = new JLabel("NVRAM: unsaved");
     private final JCheckBox testPinControl = new JCheckBox("TEST high");
-    private SharedMemoryRegion sharedMemory = new SharedMemoryRegion();
-    private final long machineStartNanos = System.nanoTime();
+    private SharedMemoryGroups sharedMemory = new SharedMemoryGroups();
+    private final JCheckBox psuControl = new JCheckBox("PSU redstone high");
+    private final VirtualGameClock worldClock = new VirtualGameClock(20);
     private int nextCpuId = 1;
-    private int configuredInstructions = 10_000, configuredTicks = 20;
+    private int configuredTicks = 20;
+    private ShardSpeed[] shardSpeeds = {ShardSpeed.TIER_1, ShardSpeed.TIER_2, ShardSpeed.TIER_3};
+    private final JComboBox<Integer> shardConfiguration = new JComboBox<>(new Integer[]{1, 2, 3});
+    private final JSpinner budget = new JSpinner(new SpinnerNumberModel(10_000, 1, Integer.MAX_VALUE, 100));
+    private final JSpinner ticks = new JSpinner(new SpinnerNumberModel(20, 1, 1000, 1));
+    private final JSpinner batches = new JSpinner(new SpinnerNumberModel(10, 1, Integer.MAX_VALUE, 1));
+    private boolean syncingPacing;
 
     private static final class CpuSlot {
         final int id;
-        LauncherController controller;
-        LauncherController.Snapshot snapshot;
+        DebuggerBackend controller;
+        DebuggerBackend.Snapshot snapshot;
 
         CpuSlot(int id) { this.id = id; }
 
@@ -51,8 +63,20 @@ public final class LauncherMain {
         }
     }
 
-    private LauncherMain() {
-        addCpuSlot();
+    interface RemoteFactory {
+        DebuggerBackend create(java.util.function.Consumer<DebuggerBackend.Snapshot> snapshots,
+                java.util.function.Consumer<String> errors, Runnable closed);
+    }
+    private final boolean remote;
+    private final List<JButton> remoteControls = new ArrayList<>();
+    private LauncherMain() { this(null); }
+    private LauncherMain(RemoteFactory factory) {
+        remote = factory != null;
+        if (remote) {
+            CpuSlot slot = new CpuSlot(1);
+            slot.controller = factory.create(snapshot -> updateSlot(slot, snapshot), this::showError, () -> frame.dispose());
+            slots.add(slot); cpuSelector.addItem(slot); cpuSelector.setSelectedItem(slot);
+        } else addCpuSlot();
         memoryView = new ByteViewPanel(5, 0xFFFFF, address -> selected().memoryBase(address),
                 (address, value) -> selected().writeMemory(address, value), LauncherController::writableMemory);
         ioView = new ByteViewPanel(4, 0xFFFF, port -> selected().ioBase(port),
@@ -65,22 +89,26 @@ public final class LauncherMain {
     private void addCpuSlot() {
         CpuSlot slot = new CpuSlot(nextCpuId++);
         slot.controller = new LauncherController(snapshot -> updateSlot(slot, snapshot), this::showError,
-                sharedMemory, () -> Math.max(0, (System.nanoTime() - machineStartNanos) / 50_000_000L));
-        slot.controller.configure(configuredInstructions, configuredTicks);
+                sharedMemory, slot.id, worldClock::ticks);
+        slot.controller.configure(shardSpeeds[2].stepsPerTick(), configuredTicks, shardSpeeds[2].batchesPerTick());
         slots.add(slot);
         cpuSelector.addItem(slot);
         cpuSelector.setSelectedItem(slot);
     }
 
-    private LauncherController selected() {
+    private DebuggerBackend selected() {
         return ((CpuSlot) cpuSelector.getSelectedItem()).controller;
     }
 
-    private void updateSlot(CpuSlot slot, LauncherController.Snapshot snapshot) {
+    private void updateSlot(CpuSlot slot, DebuggerBackend.Snapshot snapshot) {
         if (!slots.contains(slot)) return;
         slot.snapshot = snapshot;
         cpuSelector.repaint();
         if (cpuSelector.getSelectedItem() == slot) update(snapshot);
+    }
+
+    static void openRemote(RemoteFactory factory) {
+        new LauncherMain(factory).frame.setVisible(true);
     }
 
     public static void main(String[] args) {
@@ -118,19 +146,27 @@ public final class LauncherMain {
                 }
             }
         });
-        cpuButtons.add(new JLabel("CPU"));
-        cpuButtons.add(cpuSelector);
-        addButton(cpuButtons, "Add CPU", this::addCpuSlot);
-        addButton(cpuButtons, "Remove CPU", this::removeCpu);
-        addButton(cpuButtons, "Load ROM", this::chooseRom);
+        if (!remote) {
+            cpuButtons.add(new JLabel("CPU"));
+            cpuButtons.add(cpuSelector);
+            addButton(cpuButtons, "Add CPU", this::addCpuSlot);
+            addButton(cpuButtons, "Remove CPU", this::removeCpu);
+            addButton(cpuButtons, "Load ROM", this::chooseRom);
+            addButton(cpuButtons, "Hardware", this::configureHardware);
+            addButton(cpuButtons, "Save session", this::saveSession);
+            addButton(cpuButtons, "Open session", this::openSession);
+            psuControl.addActionListener(e -> selected().powerSupply(psuControl.isSelected()));
+            cpuButtons.add(psuControl);
+        } else cpuButtons.add(new JLabel("Minecraft mainframe — hardware and images are managed in game"));
+
         addButton(machineButtons, "Run", () -> selected().run());
         addButton(machineButtons, "Pause", () -> selected().pause());
-        addButton(machineButtons, "Run All", this::runAll);
-        addButton(machineButtons, "Pause All", this::pauseAll);
+        if (!remote) addButton(machineButtons, "Run All", this::runAll);
+        if (!remote) addButton(machineButtons, "Pause All", this::pauseAll);
         addButton(machineButtons, "Step", () -> selected().step());
         addButton(machineButtons, "CPU Reset", () -> selected().reset());
-        addButton(machineButtons, "Power Cycle", this::powerCycleSelected);
-        addButton(machineButtons, "Power Cycle All", this::powerCycleAll);
+        addButton(machineButtons, "Power Cycle", () -> { if (remote) selected().powerCycle(); else powerCycleSelected(); });
+        if (!remote) addButton(machineButtons, "Power Cycle All", this::powerCycleAll);
         JPanel debugButtons = new JPanel(new FlowLayout(FlowLayout.LEFT));
         addButton(debugButtons, "Skip", () -> selected().skipInstruction());
         addButton(debugButtons, "Step Over", () -> selected().stepOver());
@@ -138,23 +174,25 @@ public final class LauncherMain {
         addButton(debugButtons, "Run to Cursor", () -> withCodeSelection(i -> selected().runTo(i.cs(), i.ip())));
         addButton(debugButtons, "NMI", () -> selected().nmi());
         testPinControl.addActionListener(e -> selected().testPin(testPinControl.isSelected()));
-        debugButtons.add(testPinControl);
+        if (!remote) debugButtons.add(testPinControl);
+        if (remote) for (JPanel panel : List.of(machineButtons, debugButtons))
+            for (Component component : panel.getComponents()) if (component instanceof JButton button) remoteControls.add(button);
         buttons.add(cpuButtons);
         buttons.add(machineButtons);
         buttons.add(debugButtons);
 
         JPanel pacing = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JSpinner budget = new JSpinner(new SpinnerNumberModel(10_000, 1, 1_000_000, 1000));
-        JSpinner ticks = new JSpinner(new SpinnerNumberModel(20, 1, 1000, 1));
-        Runnable applyPacing = () -> {
-            configuredInstructions = (Integer) budget.getValue();
-            configuredTicks = (Integer) ticks.getValue();
-            for (CpuSlot slot : slots) slot.controller.configure(configuredInstructions, configuredTicks);
-        };
-        budget.addChangeListener(e -> applyPacing.run());
-        ticks.addChangeListener(e -> applyPacing.run());
-        pacing.add(new JLabel("Instructions/tick")); pacing.add(budget);
-        pacing.add(new JLabel("Ticks/s")); pacing.add(ticks);
+        shardConfiguration.setSelectedIndex(2);
+        shardConfiguration.addActionListener(e -> refreshPacingControls());
+        budget.addChangeListener(e -> applyPacing());
+        ticks.addChangeListener(e -> applyPacing());
+        batches.addChangeListener(e -> applyPacing());
+        if (!remote) {
+            pacing.add(new JLabel("Configure shard tier")); pacing.add(shardConfiguration);
+            pacing.add(new JLabel("Steps/tick")); pacing.add(budget);
+            pacing.add(new JLabel("Ticks/s")); pacing.add(ticks);
+            pacing.add(new JLabel("Batches/tick")); pacing.add(batches);
+        }
         pacing.add(rate); pacing.add(status);
 
         registers.setEditable(false);
@@ -191,10 +229,10 @@ public final class LauncherMain {
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT));
         controls.add(regions);
         controls.add(nvramStatus);
-        addButton(controls, "Open NVRAM", this::openNvram);
-        addButton(controls, "New NVRAM", this::newNvram);
-        addButton(controls, "Save NVRAM", () -> saveNvram(false));
-        addButton(controls, "Save NVRAM As", () -> saveNvram(true));
+        if (!remote) addButton(controls, "Open NVRAM", this::openNvram);
+        if (!remote) addButton(controls, "New NVRAM", this::newNvram);
+        if (!remote) addButton(controls, "Save NVRAM", () -> saveNvram(false));
+        if (!remote) addButton(controls, "Save NVRAM As", () -> saveNvram(true));
         panel.add(controls, BorderLayout.NORTH);
         panel.add(memoryView, BorderLayout.CENTER);
         return panel;
@@ -257,29 +295,37 @@ public final class LauncherMain {
     }
 
     private void chooseRom() {
+        if (selected().inspectMachine().powered()) {
+            showActionError(new IllegalStateException("Set PSU redstone low before replacing the ROM"));
+            return;
+        }
         JFileChooser chooser = new JFileChooser();
         if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
         Path path = chooser.getSelectedFile().toPath();
         try {
             if (Files.size(path) != dervogel101.de.state.CPUMemory.ROM_SIZE)
                 throw new IllegalArgumentException("ROM must be exactly 256 KiB");
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
-            if (confirmDirty(List.of(cpu), true, true)) cpu.loadRom(path);
+            cpu.loadRom(path);
         } catch (Exception error) { showActionError(error); }
     }
 
-    private void update(LauncherController.Snapshot snapshot) {
-        frame.setTitle("8086 ROM launcher — CPU " + ((CpuSlot) cpuSelector.getSelectedItem()).id + " — " + snapshot.romName());
-        status.setText(snapshot.status());
+    private void update(DebuggerBackend.Snapshot snapshot) {
+        frame.setTitle(remote ? "Minecraft mainframe debugger — " + snapshot.romName()
+                : "8086 ROM launcher — CPU " + ((CpuSlot) cpuSelector.getSelectedItem()).id + " — " + snapshot.romName());
+        if (remote) for (JButton button : remoteControls) button.setEnabled(selected().canControl());
+        status.setText(snapshot.status() + (remote && !selected().canControl() ? " — read only" : ""));
+        psuControl.setSelected(snapshot.machine().psuHigh());
         rate.setText(snapshot.instructionsPerSecond() + " instructions/s; total " + snapshot.totalInstructions());
         registers.setText(snapshot.registers());
-        boolean loaded = !snapshot.romName().equals("No ROM loaded");
+        boolean loaded = !snapshot.romName().equals("No ROM loaded")
+                && (!remote || selected().canEdit());
         memoryView.update(snapshot.memoryBase(), snapshot.memory(), loaded);
         ioView.update(snapshot.ioBase(), snapshot.io(), loaded);
         deviceView.update(snapshot.devices(), snapshot.images(), loaded);
         testPinControl.setSelected(snapshot.testHigh());
-        nvramStatus.setText("NVRAM: " + (snapshot.images().nvramPath() == null
+        nvramStatus.setText(remote ? "NVRAM: managed by Minecraft" : "NVRAM: " + (snapshot.images().nvramPath() == null
                 ? "Unsaved" : snapshot.images().nvramPath().getFileName())
                 + (snapshot.images().nvramDirty() ? " *" : ""));
         if (!terminalLog.getText().equals(snapshot.terminalLog())) {
@@ -318,27 +364,22 @@ public final class LauncherMain {
     }
 
     private void powerCycleSelected() {
-        try {
-            LauncherController cpu = selected();
-            cpu.pauseAndWait();
-            if (confirmDirty(List.of(cpu), true, true)) cpu.powerCycle();
-        } catch (Exception error) { showActionError(error); }
+        selected().powerCycle();
     }
 
     private void powerCycleAll() {
         try {
-            List<LauncherController> cpus = slots.stream().map(slot -> slot.controller).toList();
-            for (LauncherController cpu : cpus) cpu.pauseAndWait();
-            if (!confirmDirty(cpus, true, true)) return;
-            sharedMemory = new SharedMemoryRegion();
-            for (LauncherController cpu : cpus) cpu.powerCycleWithSharedMemory(sharedMemory);
+            List<DebuggerBackend> cpus = slots.stream().map(slot -> slot.controller).toList();
+            List<Boolean> restart = cpus.stream().map(DebuggerBackend::powerOffForCycle).toList();
+            for (int i = 0; i < cpus.size(); i++) cpus.get(i).powerOnAfterCycle(restart.get(i));
         } catch (Exception error) { showActionError(error); }
     }
 
     private void closeLauncher() {
+        if (remote) { selected().close(); frame.dispose(); return; }
         try {
-            List<LauncherController> cpus = slots.stream().map(slot -> slot.controller).toList();
-            for (LauncherController cpu : cpus) cpu.pauseAndWait();
+            List<DebuggerBackend> cpus = slots.stream().map(slot -> slot.controller).toList();
+            for (DebuggerBackend cpu : cpus) cpu.pauseAndWait();
             if (confirmDirty(cpus, true, true)) frame.dispose();
         } catch (Exception error) { showActionError(error); }
     }
@@ -348,7 +389,7 @@ public final class LauncherMain {
         if (path == null) return;
         try {
             requireSize(path, dervogel101.de.state.CPUMemory.NVRAM_SIZE);
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
             if (confirmDirty(List.of(cpu), true, false)) cpu.openNvram(path);
         } catch (Exception error) { showActionError(error); }
@@ -356,7 +397,7 @@ public final class LauncherMain {
 
     private void newNvram() {
         try {
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
             if (confirmDirty(List.of(cpu), true, false)) cpu.newNvram();
         } catch (Exception error) { showActionError(error); }
@@ -364,7 +405,7 @@ public final class LauncherMain {
 
     private void saveNvram(boolean saveAs) {
         try {
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             Path path = saveAs ? null : cpu.inspectImages().nvramPath();
             if (path == null) path = chooseFile(true);
             if (path != null) cpu.saveNvram(path);
@@ -376,7 +417,7 @@ public final class LauncherMain {
         if (path == null) return;
         try {
             requireSize(path, dervogel101.de.state.IoStorageDevice.SIZE);
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
             if (confirmDirty(List.of(cpu), false, true)) cpu.openStorage(path);
         } catch (Exception error) { showActionError(error); }
@@ -384,7 +425,7 @@ public final class LauncherMain {
 
     private void newStorage() {
         try {
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
             if (confirmDirty(List.of(cpu), false, true)) cpu.newStorage();
         } catch (Exception error) { showActionError(error); }
@@ -392,8 +433,8 @@ public final class LauncherMain {
 
     private void saveStorage(boolean saveAs) {
         try {
-            LauncherController cpu = selected();
-            LauncherController.ImageState images = cpu.inspectImages();
+            DebuggerBackend cpu = selected();
+            DebuggerBackend.ImageState images = cpu.inspectImages();
             if (!images.storageConnected()) return;
             Path path = saveAs ? null : images.storagePath();
             if (path == null) path = chooseFile(true);
@@ -403,15 +444,15 @@ public final class LauncherMain {
 
     private void disconnectStorage() {
         try {
-            LauncherController cpu = selected();
+            DebuggerBackend cpu = selected();
             cpu.pauseAndWait();
             if (confirmDirty(List.of(cpu), false, true)) cpu.disconnectStorage();
         } catch (Exception error) { showActionError(error); }
     }
 
-    private boolean confirmDirty(List<LauncherController> cpus, boolean nvram, boolean storage) {
+    private boolean confirmDirty(List<DebuggerBackend> cpus, boolean nvram, boolean storage) {
         return ImageTransitions.resolve(cpus, nvram, storage, new ImageTransitions.Prompt() {
-            @Override public ImageTransitions.Decision decide(LauncherController cpu, ImageTransitions.Kind kind) {
+            @Override public ImageTransitions.Decision decide(DebuggerBackend cpu, ImageTransitions.Kind kind) {
                 int id = slots.stream().filter(slot -> slot.controller == cpu).findFirst().orElseThrow().id;
                 int choice = dirtyChoice("CPU " + id + " " + (kind == ImageTransitions.Kind.NVRAM ? "NVRAM" : "I/O storage"));
                 return switch (choice) {
@@ -421,7 +462,7 @@ public final class LauncherMain {
                 };
             }
 
-            @Override public Path choosePath(LauncherController cpu, ImageTransitions.Kind kind) {
+            @Override public Path choosePath(DebuggerBackend cpu, ImageTransitions.Kind kind) {
                 return chooseFile(true);
             }
         });
@@ -496,5 +537,109 @@ public final class LauncherMain {
             if (col == 1) return java.util.HexFormat.ofDelimiter(" ").formatHex(ins.bytes());
             return ins.assembly() + (ins.unsupported() ? "  [unsupported]" : "");
         }
+    }
+
+    private void configureHardware() {
+        try {
+            DebuggerBackend cpu = selected();
+            var machine = cpu.inspectMachine();
+            if (machine.powered()) throw new IllegalStateException("Set PSU redstone low before changing hardware");
+            JPanel panel = new JPanel(new GridLayout(0, 2, 8, 4));
+            var fields = new EnumMap<Hardware, JSpinner>(Hardware.class);
+            for (Hardware part : Hardware.values()) {
+                panel.add(new JLabel(part.displayName));
+                JSpinner count = new JSpinner(new SpinnerNumberModel(machine.hardware().count(part), part.required ? 1 : 0, part.maximum, 1));
+                fields.put(part, count); panel.add(count);
+            }
+            JComboBox<String> crystal = new JComboBox<>(new String[]{"No shard", "Tier 1", "Tier 2", "Tier 3"});
+            crystal.setSelectedIndex(machine.shardTier());
+            JTextField memoryId = new JTextField(machine.memoryId(), 32);
+            panel.add(new JLabel("Speed shard")); panel.add(crystal);
+            panel.add(new JLabel("Shared-memory ID")); panel.add(memoryId);
+            if (JOptionPane.showConfirmDialog(frame, panel, "CPU hardware", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+            var counts = new EnumMap<Hardware, Integer>(Hardware.class);
+            fields.forEach((part, count) -> counts.put(part, (Integer) count.getValue()));
+            int tier = crystal.getSelectedIndex();
+            var profile = new HardwareProfile(counts);
+            profile.validationError().ifPresent(error -> { throw new IllegalArgumentException(error); });
+            SharedMemoryGroups.normalize(memoryId.getText());
+            ShardSpeed speed = shardSpeeds[tier == 0 ? 2 : tier - 1];
+            cpu.configure(speed.stepsPerTick(), configuredTicks, speed.batchesPerTick());
+            cpu.configureMachine(profile, tier, memoryId.getText());
+        } catch (Exception error) { showActionError(error); }
+    }
+
+    private void saveSession() {
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showSaveDialog(frame) != JFileChooser.APPROVE_OPTION) return;
+        List<Boolean> resume = new ArrayList<>();
+        try {
+            for (CpuSlot slot : slots) resume.add(slot.controller.suspendForSession());
+            List<LauncherSession.Cpu> saved = new ArrayList<>();
+            for (int i = 0; i < slots.size(); i++) {
+                CpuSlot slot = slots.get(i);
+                saved.add(new LauncherSession.Cpu(slot.id, slot.controller.saveSessionState(resume.get(i))));
+            }
+            LauncherSession.save(chooser.getSelectedFile().toPath(), new LauncherSession.State(
+                    worldClock.ticks(), configuredTicks, nextCpuId, sharedMemory.snapshot(), saved, List.of(shardSpeeds)));
+        } catch (Exception error) { showActionError(error); }
+        finally {
+            for (int i = 0; i < resume.size(); i++) if (resume.get(i)) slots.get(i).controller.run();
+        }
+    }
+
+    private void openSession() {
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
+        List<CpuSlot> prepared = new ArrayList<>();
+        List<Boolean> resume = new ArrayList<>();
+        try {
+            var saved = LauncherSession.load(chooser.getSelectedFile().toPath());
+            var nextGroups = new SharedMemoryGroups(); nextGroups.restore(saved.regions());
+            for (var record : saved.cpus()) {
+                CpuSlot slot = new CpuSlot(record.id());
+                slot.controller = new LauncherController(snapshot -> updateSlot(slot, snapshot), this::showError,
+                        nextGroups, slot.id, worldClock::ticks);
+                prepared.add(slot);
+                resume.add(slot.controller.restoreSessionState(record.state()));
+            }
+            List<DebuggerBackend> old = slots.stream().map(slot -> slot.controller).toList();
+            for (var cpu : old) cpu.pauseAndWait();
+            if (!confirmDirty(old, true, true)) return;
+            for (var cpu : old) cpu.close();
+            slots.clear(); cpuSelector.removeAllItems(); sharedMemory = nextGroups;
+            configuredTicks = saved.tickRate(); worldClock.setRate(configuredTicks); worldClock.restoreTicks(saved.ticks());
+            shardSpeeds = saved.shards().toArray(ShardSpeed[]::new); refreshPacingControls();
+            nextCpuId = saved.nextCpuId(); slots.addAll(prepared);
+            for (var slot : slots) cpuSelector.addItem(slot);
+            cpuSelector.setSelectedIndex(0);
+            prepared.clear();
+            for (int i = 0; i < slots.size(); i++) if (resume.get(i)) slots.get(i).controller.run();
+        } catch (Exception error) { showActionError(error); }
+        finally { for (var slot : prepared) slot.controller.close(); }
+    }
+
+    private void refreshPacingControls() {
+        syncingPacing = true;
+        try {
+            ShardSpeed speed = shardSpeeds[shardConfiguration.getSelectedIndex()];
+            budget.setValue(speed.stepsPerTick()); batches.setValue(speed.batchesPerTick()); ticks.setValue(configuredTicks);
+        } finally { syncingPacing = false; }
+    }
+
+    private void applyPacing() {
+        if (syncingPacing) return;
+        syncingPacing = true;
+        try {
+            int steps = (Integer) budget.getValue();
+            if ((Integer) batches.getValue() > steps) batches.setValue(steps);
+            shardSpeeds[shardConfiguration.getSelectedIndex()] = new ShardSpeed(steps, (Integer) batches.getValue());
+            configuredTicks = (Integer) ticks.getValue(); worldClock.setRate(configuredTicks);
+            for (CpuSlot slot : slots) {
+                int tier = slot.controller.inspectMachine().shardTier();
+                ShardSpeed speed = shardSpeeds[tier == 0 ? 2 : tier - 1];
+                slot.controller.configure(speed.stepsPerTick(), configuredTicks, speed.batchesPerTick());
+            }
+        } finally { syncingPacing = false; }
     }
 }
