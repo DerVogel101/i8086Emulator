@@ -21,6 +21,7 @@ public class CPU8086 {
     private final CPUInstructions instructions;
     private HardwareProfile hardware = HardwareProfile.complete();
     private boolean halted;
+    private final dervogel101.de.i86.runtime.CpuActivity activity = new dervogel101.de.i86.runtime.CpuActivity();
     private int irqDelay;
 
     public CPU8086() {
@@ -39,6 +40,7 @@ public class CPU8086 {
         registers = new CPURegister();
         memory = new CPUMemory(sharedMemory);
         io = new CPUIO();
+        memory.activity(activity); io.activity(activity);
         hostBridge = new CpuHostBridge(memory, io, clock);
         instructions = new CPUInstructions(this, registers, memory, io);
         resetCpu();
@@ -54,6 +56,7 @@ public class CPU8086 {
     }
 
     public HardwareProfile hardware() { return hardware; }
+    public dervogel101.de.i86.runtime.CpuActivity activity() { return activity; }
 
     public CpuHostBridge hostBridge() {
         return hostBridge;
@@ -63,7 +66,10 @@ public class CPU8086 {
     public void reset() {
         beforeInstruction();
         hostBridge.consumeReset();
+        activity.mark(Hardware.RESET, 2);
         resetCpu();
+        activity.mark(Hardware.RESET, 4);
+        activity.waiting(false);
         hostBridge.discardNmi();
     }
 
@@ -82,20 +88,31 @@ public class CPU8086 {
     }
 
     public StepOutcome step() {
+        activity.executing(true);
+        try { return stepGuest(); }
+        finally { activity.executing(false); }
+    }
+
+    private StepOutcome stepGuest() {
         beforeInstruction();
         if (hostBridge.consumeReset()) {
+            activity.mark(Hardware.RESET, 2);
             resetCpu();
+            activity.mark(Hardware.RESET, 4);
+            activity.waiting(false);
             hostBridge.discardNmi();
             return StepOutcome.EVENT;
         }
         if (hostBridge.resetPinHigh()) return StepOutcome.IDLE;
         if (hostBridge.consumeNmi()) {
             halted = false;
+            activity.mark(Hardware.NMI, 4); activity.waiting(false);
             instructions.enterInterrupt(2);
             return StepOutcome.EVENT;
         }
         if (hostBridge.irqPending() && registers.getIF() && irqDelay == 0) {
             halted = false;
+            activity.mark(Hardware.INTERRUPTS, 2); activity.waiting(false);
             instructions.enterInterrupt(0x20);
             return StepOutcome.EVENT;
         }
@@ -103,6 +120,7 @@ public class CPU8086 {
         int cs = registers.getCs();
         int ip = registers.getIp();
         halted = instructions.execute(fetch8(), cs, ip, hostBridge.testPinHigh());
+        activity.waiting(instructions.waitStalled());
         if (!instructions.waitStalled()) {
             if (instructions.interruptDelayRequested()) irqDelay = 1;
             else if (irqDelay > 0) irqDelay--;

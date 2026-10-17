@@ -26,6 +26,9 @@ public class CPUIO {
     private static final int[] GAME_RESOLUTIONS = {1, 5, 10, 20};
 
     private HardwareProfile hardware = HardwareProfile.complete();
+    private dervogel101.de.i86.runtime.CpuActivity activity;
+    public void activity(dervogel101.de.i86.runtime.CpuActivity value) { activity = value; }
+    public dervogel101.de.i86.runtime.CpuActivity activity() { return activity; }
     private final byte[] ports = new byte[1 << 16];
     private final BitSet changedRedstone = new BitSet(128);
     private final BitSet changedSigns = new BitSet(SIGN_COUNT);
@@ -58,6 +61,18 @@ public class CPUIO {
         if (port >= IRQ_FIRST) return hardware.has(Hardware.INTERRUPTS);
         return false;
     }
+
+    public int readGuest8(int port) {
+        int value = read8(port);
+        if (activity != null && available(port & 0xffff)) activity.readIo(port & 0xffff);
+        return value;
+    }
+    public int readGuest16(int port) { return readGuest8(port) | readGuest8(port + 1) << 8; }
+    public void writeGuest8(int port, int value) {
+        write8(port, value);
+        if (activity != null && available(port & 0xffff)) activity.writeIo(port & 0xffff);
+    }
+    public void writeGuest16(int port, int value) { writeGuest8(port, value); writeGuest8(port + 1, value >>> 8); }
 
     public synchronized int read8(int port) {
         port &= 0xFFFF;
@@ -185,8 +200,13 @@ public class CPUIO {
         int commands = storageCommands;
         storageCommands = 0;
         if (storageDevice == null || !hardware.has(Hardware.DISK)) return;
-        if ((commands & 1) != 0) storageData = storageDevice.readWord(storageAddress);
-        else if ((commands & 2) != 0) storageDevice.writeWord(storageAddress, storageData);
+        if ((commands & 1) != 0) {
+            storageData = storageDevice.readWord(storageAddress);
+            if (activity != null) activity.mark(Hardware.DISK, 1);
+        } else if ((commands & 2) != 0) {
+            storageDevice.writeWord(storageAddress, storageData);
+            if (activity != null) activity.mark(Hardware.DISK, 2);
+        }
     }
 
     public synchronized IoStorageDevice.Snapshot snapshotStorageIfDirty() {
@@ -262,6 +282,7 @@ public class CPUIO {
                 timer.countdown = 0;
                 if ((timer.control & 2) == 0) timer.control &= ~1;
             }
+            if (activity != null) activity.mark(Hardware.CLOCK, 4);
             if ((timer.control & 4) != 0) irqSink.queue(((i < 3 ? 2 : 3) << 8) | (i % 3), expirations);
         }
     }

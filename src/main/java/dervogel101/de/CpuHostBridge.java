@@ -55,11 +55,14 @@ public final class CpuHostBridge {
     private boolean nmiPinHigh;
     private boolean resetPending;
     private boolean nmiPending;
+    private final java.util.concurrent.atomic.AtomicLong hostErrors = new java.util.concurrent.atomic.AtomicLong();
+    public long hostErrors() { return hostErrors.get(); }
 
     CpuHostBridge(CPUMemory memory, CPUIO io, Clock clock) {
         Arrays.fill(redstoneIrqs, RedstoneIrqMode.DISABLED);
         this.memory = memory;
         this.io = io;
+        if (io.activity() == null) io.activity(new dervogel101.de.i86.runtime.CpuActivity());
         this.clock = clock;
         this.sharedMemory = memory.sharedMemory();
     }
@@ -161,6 +164,8 @@ public final class CpuHostBridge {
 
     private void enqueueIrq(int deviceId) {
         if (!hardware.has(Hardware.INTERRUPTS)) return;
+        io.activity().mark(Hardware.INTERRUPTS, 1);
+        if ((deviceId >>> 8) == 0) io.activity().redstoneIrq(deviceId & 255);
         if (activeIrq < 0) activeIrq = deviceId;
         else {
             if (waitingIrqs.size() == 255) {
@@ -194,7 +199,7 @@ public final class CpuHostBridge {
 
     /** A manual NMI event leaves the external pin level intact. RESET still has priority. */
     public void submitNmiPulse() {
-        pendingInputs.add(() -> { if (!resetPinHigh) nmiPending = true; });
+        pendingInputs.add(() -> { if (!resetPinHigh) { nmiPending = true; io.activity().mark(Hardware.NMI, 2); } });
     }
 
     public void submitNmiPin(boolean high) {
@@ -204,7 +209,7 @@ public final class CpuHostBridge {
     /** A chunk reattachment resamples levels without synthesizing a missed edge. */
     public void submitNmiPin(boolean high, boolean notify) {
         pendingInputs.add(() -> {
-            if (notify && high && !nmiPinHigh && !resetPinHigh) nmiPending = true;
+            if (notify && high && !nmiPinHigh && !resetPinHigh) { nmiPending = true; io.activity().mark(Hardware.NMI, 2); }
             nmiPinHigh = high;
         });
     }
@@ -260,12 +265,14 @@ public final class CpuHostBridge {
     public void beforeInstruction() {
         int commands = io.consumeIrqCommands();
         if ((commands & 4) != 0) irqOverflow = false;
-        if ((commands & 1) != 0 && activeIrq >= 0)
+        if ((commands & 1) != 0 && activeIrq >= 0) {
+            io.activity().mark(Hardware.INTERRUPTS, 4);
             activeIrq = waitingIrqs.isEmpty() ? -1 : waitingIrqs.removeFirst();
+        }
         Runnable input;
         while ((input = pendingInputs.poll()) != null) input.run();
         io.serviceStorageCommand();
-        io.sendTerminalIfPending(this::appendTerminal);
+        io.sendTerminalIfPending(bytes -> { io.activity().mark(Hardware.TERMINAL, 1); appendTerminal(bytes); });
         io.setIrqStatus(activeIrq, irqOverflow);
     }
 
@@ -283,6 +290,7 @@ public final class CpuHostBridge {
 
     /** A read-only snapshot of the newest terminal characters. */
     public void reportHostError(String message) {
+        hostErrors.incrementAndGet();
         if (hardware.has(Hardware.TERMINAL)) appendTerminal(message.getBytes(WINDOWS_1252));
     }
 

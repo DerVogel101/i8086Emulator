@@ -24,6 +24,8 @@ public class CPUMemory {
     private final byte[] rom = new byte[ROM_SIZE];
     private boolean clockAvailable = true, nvramAvailable = true, sharedAvailable = true;
     private long nvramVersion;
+    private dervogel101.de.i86.runtime.CpuActivity activity;
+    public void activity(dervogel101.de.i86.runtime.CpuActivity value) { activity = value; }
     private long savedNvramVersion;
 
     public CPUMemory() {
@@ -55,6 +57,7 @@ public class CPUMemory {
     public int read16(int segment, int offset) {
         int address = physicalAddress(segment, offset);
         if (sharedAvailable && address >= SHARED_START && address < ROM_START - 1) {
+            if (activity != null) activity.memory(Hardware.SHARED_MEMORY, 1);
             return sharedMemory.read16(address - SHARED_START);
         }
         return readPhysical8(address) | (readPhysical8(address + 1) << 8);
@@ -67,6 +70,7 @@ public class CPUMemory {
     public void write16(int segment, int offset, int value) {
         int address = physicalAddress(segment, offset);
         if (sharedAvailable && address >= SHARED_START && address < ROM_START - 1) {
+            if (activity != null) activity.memory(Hardware.SHARED_MEMORY, 2);
             sharedMemory.write16(address - SHARED_START, value);
             return;
         }
@@ -140,9 +144,18 @@ public class CPUMemory {
     private int readPhysical8(int address) {
         address &= 0xFFFFF;
         if (address < CLOCK_START) return Byte.toUnsignedInt(ram[address]);
-        if (address < NVRAM_START) return clockAvailable ? Byte.toUnsignedInt(clock[address - CLOCK_START]) : 0;
-        if (address < SHARED_START) return nvramAvailable ? Byte.toUnsignedInt(nvram[address - NVRAM_START]) : 0;
-        if (address < ROM_START) return sharedAvailable ? sharedMemory.read8(address - SHARED_START) : 0;
+        if (address < NVRAM_START) {
+            if (clockAvailable && activity != null) activity.memory(Hardware.CLOCK, 1);
+            return clockAvailable ? Byte.toUnsignedInt(clock[address - CLOCK_START]) : 0;
+        }
+        if (address < SHARED_START) {
+            if (nvramAvailable && activity != null) activity.memory(Hardware.NVRAM, 1);
+            return nvramAvailable ? Byte.toUnsignedInt(nvram[address - NVRAM_START]) : 0;
+        }
+        if (address < ROM_START) {
+            if (sharedAvailable && activity != null) activity.memory(Hardware.SHARED_MEMORY, 1);
+            return sharedAvailable ? sharedMemory.read8(address - SHARED_START) : 0;
+        }
         return Byte.toUnsignedInt(rom[address - ROM_START]);
     }
 
@@ -151,6 +164,7 @@ public class CPUMemory {
         if (address < CLOCK_START) {
             ram[address] = (byte) value;
         } else if (nvramAvailable && address >= NVRAM_START && address < SHARED_START) {
+            if (activity != null) activity.memory(Hardware.NVRAM, 2);
             synchronized (this) {
                 int index = address - NVRAM_START;
                 if (nvram[index] != (byte) value) {
@@ -159,6 +173,7 @@ public class CPUMemory {
                 }
             }
         } else if (sharedAvailable && address >= SHARED_START && address < ROM_START) {
+            if (activity != null) activity.memory(Hardware.SHARED_MEMORY, 2);
             sharedMemory.write8(address - SHARED_START, value);
         }
     }

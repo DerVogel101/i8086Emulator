@@ -30,11 +30,11 @@ final class IoCpuControlInstructions {
             int port = opcode >= 0xEC ? registers.getDx() : cpu.fetch8();
             boolean word = (opcode & 1) != 0;
             if ((opcode & 2) == 0) {
-                int value = word ? io.read16(port) : io.read8(port);
+                int value = word ? io.readGuest16(port) : io.readGuest8(port);
                 registers.setAx(word ? value : (registers.getAx() & 0xFF00) | value);
             } else {
-                if (word) io.write16(port, registers.getAx());
-                else io.write8(port, registers.getAx());
+                if (word) io.writeGuest16(port, registers.getAx());
+                else io.writeGuest8(port, registers.getAx());
             }
             return false;
         }
