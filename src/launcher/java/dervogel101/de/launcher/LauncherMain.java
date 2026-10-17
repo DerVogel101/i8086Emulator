@@ -284,7 +284,7 @@ public final class LauncherMain {
         codeScroll.setUnitIncrement(1);
         codeScroll.setBlockIncrement(256);
         codeScroll.addAdjustmentListener(e -> {
-                if (!syncingCodeScroll) selected().codeAddress(visibleCodeCs, e.getValue());
+                if (!syncingCodeScroll && !e.getValueIsAdjusting()) selected().codeAddress(visibleCodeCs, e.getValue());
         });
         panel.add(codeScroll, BorderLayout.EAST);
         return panel;
@@ -333,7 +333,7 @@ public final class LauncherMain {
             terminalLog.setCaretPosition(terminalLog.getDocument().getLength());
         }
         codeModel.update(snapshot.code());
-        if (!codeAddressField.isFocusOwner() && !snapshot.code().isEmpty()) {
+        if (!codeAddressField.isFocusOwner() && !codeScroll.getValueIsAdjusting() && !snapshot.code().isEmpty()) {
             var first = snapshot.code().getFirst();
             visibleCodeCs = first.cs();
             syncingCodeScroll = true;

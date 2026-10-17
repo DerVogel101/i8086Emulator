@@ -57,7 +57,7 @@ final class ByteViewPanel extends JPanel {
         addressScroll.setUnitIncrement(16);
         addressScroll.setBlockIncrement(256);
         addressScroll.addAdjustmentListener(e -> {
-            if (!syncingScroll) onAddress.accept(e.getValue());
+            if (!syncingScroll && !e.getValueIsAdjusting()) onAddress.accept(e.getValue());
         });
         add(addressScroll, BorderLayout.EAST);
     }
@@ -69,9 +69,11 @@ final class ByteViewPanel extends JPanel {
 
     void update(int base, byte[] bytes, boolean loaded) {
         model.update(base, bytes, loaded);
-        syncingScroll = true;
-        addressScroll.setValue(base);
-        syncingScroll = false;
+        if (!addressScroll.getValueIsAdjusting()) {
+            syncingScroll = true;
+            addressScroll.setValue(base);
+            syncingScroll = false;
+        }
         if (!address.isFocusOwner()) address.setText(("%0" + model.digits + "X").formatted(base));
     }
 

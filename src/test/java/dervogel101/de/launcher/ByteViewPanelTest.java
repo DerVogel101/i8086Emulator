@@ -6,12 +6,33 @@ import javax.swing.*;
 import java.awt.*;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class ByteViewPanelTest {
+    @Test
+    void thumbDragKeepsItsPositionAndRequestsOnlyTheFinalAddress() throws Exception {
+        SwingUtilities.invokeAndWait(() -> {
+            for (int mask : new int[]{0xFFFF, 0xFFFFF}) {
+                List<Integer> addresses = new ArrayList<>();
+                ByteViewPanel view = new ByteViewPanel(mask == 0xFFFF ? 4 : 5, mask,
+                        addresses::add, (a, b) -> {}, a -> true);
+                JScrollBar scrollbar = (JScrollBar) ((BorderLayout) view.getLayout()).getLayoutComponent(BorderLayout.EAST);
+                view.update(0, new byte[256], true);
+                scrollbar.setValueIsAdjusting(true);
+                for (int address = 16; address <= 6400; address += 16) scrollbar.setValue(address);
+                assertEquals(List.of(), addresses);
+                view.update(0, new byte[256], true);
+                assertEquals(6400, scrollbar.getValue(), "A snapshot must not move a thumb being dragged");
+                scrollbar.setValueIsAdjusting(false);
+                assertEquals(List.of(6400), addresses);
+            }
+        });
+    }
+
     @Test
     void snapshotRefreshKeepsInstructionAndByteSelections() throws Exception {
         SwingUtilities.invokeAndWait(() -> {
