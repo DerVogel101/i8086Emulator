@@ -43,6 +43,9 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    val punchcardRom = providers.environmentVariable("PUNCHCARD_TEST_ROM").orNull
+    inputs.property("punchcardTestRom", punchcardRom ?: "<unset>")
+    if (!punchcardRom.isNullOrBlank()) inputs.file(file(punchcardRom)).withPropertyName("punchcardTestRomImage")
     val editorRom = providers.environmentVariable("KEYBOARD_EDITOR_ROM").orNull
     inputs.property("keyboardEditorRom", editorRom ?: "<unset>")
     if (!editorRom.isNullOrBlank()) inputs.file(file(editorRom)).withPropertyName("keyboardEditorRomImage")

@@ -12,7 +12,10 @@
 | `0x8160`–`0x8164` | Nonvolatile storage   | Data, word address, command/status    |
 | `0x8165`–`0x816F` | Unassigned            | Reads return zero; writes are ignored |
 | `0x8170`-`0x817F` | Eight keyboards       | Two ports per slot                    |
-| `0x8180`–`0xFEFF` | Unassigned            | Reads return zero; writes are ignored |
+| `0x8180`–`0x81FF` | Unassigned            | Reads return zero; writes are ignored |
+| `0x8200`–`0x85FF` | 16 punchcard readers  | 64 ports per reader |
+| `0x8600`–`0x89FF` | 16 punchcard writers  | 64 ports per writer |
+| `0x8A00`–`0xFEFF` | Unassigned            | Reads return zero; writes are ignored |
 | `0xFF00`–`0xFF02` | IRQ queue             | Active device ID and control/status   |
 | `0xFF03`–`0xFFFF` | Unassigned            | Reads return zero; writes are ignored |
 
@@ -53,6 +56,45 @@ Text uses Windows-1258. Unmodified Backspace, Tab and Enter are `0x08`, `0x09` a
 | `0x96` through `0x9B` | Insert, Delete, Home, End, Page Up, Page Down                  |
 
 These special codes replace characters unreachable through standard DE/US typing. Num Lock does not alter them; main-section operators remain text, and euro remains `0x80`. The C hardware library exports the port/bit macros and `IRQ_DEVICE_KEYBOARD`; `keyboard.h` adds key constants, nonblocking reads and IRQ-manager bindings.
+
+## Punchcards
+
+One optional Punchcard Controller enables all 16 reader and 16 writer slots.
+Reader base is `0x8200 + 64*n`, writer base `0x8600 + 64*n`. IRQ types 5 and 6
+identify readers and writers, with the slot in the low byte. Polling requires no
+Interrupt Controller. Missing Punchcard Controllers return zero and ignore writes.
+
+Offsets `00–1F` are a shared 32-byte row/metadata buffer; `20` command, `21` status,
+`22` write-one-clear event reasons, `23` error, `24–25` total cards, `26–27`
+reader unread cards / writer unused card capacity, `28–29` current card index,
+`2A` row position (0–8), `2B` sealed/name-written/description-written flags
+(bits 0/1/2). `2C` selects metadata: 0 name (default), 1 description.
+Offsets `2D–3F` are reserved. Word registers are unsigned little-endian.
+
+Command bits 0–7 respectively request row read, row write, name read, name write,
+next card, eject, completion ACK, and error clear. Submit one at a time. A write
+captures 32 bytes, admission occurs at an instruction boundary, and the transfer
+finishes at the next host tick. A result remains protected until completion ACK.
+Eight rows fill a 256-byte card; next-card is a separate one-tick operation.
+No register read advances the deck. Reader reinsertion rewinds; writers accept
+blank media, grow to 256 cards, and seal on removal/eject. Partial cards are padded
+with zero rows. The name and description are separate 32-byte Windows-1252 fields, each
+writeable once before data. Name commands use the `2C` selector captured at
+submission, with the same completion event and ACK. Metadata never moves the
+card cursor. The media name supplies the Minecraft item's initial name;
+anvil custom names override it without modifying media. Byte size is 32-bit `cards * 256`.
+
+Status bits 0–7: connected, media present, busy, result ready, end-of-card,
+end-of-deck/full, output occupied, error. Event bits 0–6: insertion, row completion,
+name completion, card switch, eject, removal, error. Each event raises the device
+IRQ; queue ACK, event clear, and result ACK are independent. Ejection waits while
+output is occupied. CPU RESET preserves state; the host owns/persists media and
+transport progress separately from CPU snapshots and reconnects after power-on.
+
+Error codes: 1 invalid/conflicting command, 2 busy/result pending, 3 no media,
+4 card boundary, 5 deck end, 6 sealed, 7 metadata field locked, 8 media I/O. Failed commands
+leave data unchanged. C macros and IRQ types are exported by `hardware.h`, with
+nonblocking transfers and caller-owned IRQ bindings in `punchcard.h`.
 
 ## Timers
 

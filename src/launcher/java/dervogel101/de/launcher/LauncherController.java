@@ -4,6 +4,8 @@ import dervogel101.de.CPU8086;
 import dervogel101.de.i86.runtime.ShardSpeed;
 import dervogel101.de.i86.runtime.Hardware;
 import dervogel101.de.i86.runtime.HardwareProfile;
+import dervogel101.de.i86.runtime.PunchcardDeck;
+import dervogel101.de.i86.runtime.PunchcardDevice;
 import dervogel101.de.i86.runtime.RedstoneIrqMode;
 import dervogel101.de.state.SharedMemoryGroups;
 import java.nio.charset.Charset;
@@ -97,6 +99,9 @@ final class LauncherController implements DebuggerBackend {
     private int codeCs = 0xFFFF, codeIp;
     private boolean followPc = true;
     private int selectedChannel, selectedSign, selectedTimer, selectedKeyboard;
+    private int selectedPunchcard;
+    private final PunchcardDevice[] punchcardDevices = new PunchcardDevice[32];
+    private final java.util.Map<java.util.UUID,String> savedPunchcards = new java.util.HashMap<>();
     private long gameTime;
     private long lastSubmittedGameTime = Long.MIN_VALUE;
     private long rateInstructions, rateStart = System.nanoTime(), measuredRate;
@@ -116,6 +121,11 @@ final class LauncherController implements DebuggerBackend {
         worker.setRemoveOnCancelPolicy(true);
         cpu = new CPU8086(sharedMemory);
         worker.scheduleWithFixedDelay(this::publish, 0, 200, TimeUnit.MILLISECONDS);
+        worker.scheduleWithFixedDelay(() -> {
+            if (!powered || running || !hardware.has(Hardware.PUNCHCARD)) return;
+            long time = this.worldTime.getAsLong(); cpu.hostBridge().submitWorldTime(time,time);
+            cpu.hostBridge().servicePunchcardTick();
+        },50,50,TimeUnit.MILLISECONDS);
     }
 
     LauncherController(Consumer<Snapshot> onSnapshot, Consumer<String> onError,
@@ -554,6 +564,87 @@ final class LauncherController implements DebuggerBackend {
         selectedSign = sign;
     })); }
 
+    public void selectPunchcard(int index) {
+        if (index < 0 || index >= 32) throw new IllegalArgumentException("Punchcard slot");
+        call(() -> { selectedPunchcard = index; publish(); return null; });
+    }
+    public void punchcardCommand(int index,int operation,String hex) { punchcardCommand(index,operation,hex,0); }
+    public void punchcardCommand(int index,int operation,String hex,int metadata) {
+        call(() -> {
+            if (running || !powered) throw new IllegalStateException("Pause a powered CPU before editing punchcard I/O");
+            punchcardDevice(index);
+            if (operation <= 0 || operation > 255 || Integer.bitCount(operation) != 1 || metadata < 0 || metadata > 1)
+                throw new IllegalArgumentException("Invalid punchcard command or metadata selector");
+            byte[] bytes = operation == PunchcardDevice.WRITE || operation == PunchcardDevice.WRITE_NAME ? java.util.HexFormat.of().parseHex(hex.replace(" ","")) : new byte[0];
+            if ((operation == PunchcardDevice.WRITE || operation == PunchcardDevice.WRITE_NAME) && bytes.length != 32) throw new IllegalArgumentException("Enter exactly 32 hexadecimal bytes");
+            int base = 0x8200+index*64;
+            cpu.io().write8(base+0x2c,metadata);
+            for (int i=0;i<bytes.length;i++) cpu.io().write8(base+i,bytes[i]&255);
+            cpu.io().write8(base+32,operation); cpu.beforeInstruction(); publish(); return null;
+        });
+    }
+    private PunchcardDevice punchcardDevice(int index) {
+        if (index < 0 || index >= 32) throw new IllegalArgumentException("Punchcard slot");
+        if (punchcardDevices[index] == null) punchcardDevices[index] = new PunchcardDevice(index >= 16);
+        return punchcardDevices[index];
+    }
+    public PunchcardDeck punchcardMedia(int index, boolean output) {
+        return call(() -> output ? punchcardDevice(index).output() : punchcardDevice(index).active());
+    }
+    public void insertPunchcard(int index, PunchcardDeck deck) {
+        call(() -> {
+            for (var device : punchcardDevices) if (device != null) for (var existing : new PunchcardDeck[]{device.active(),device.output()})
+                if (existing != null && existing.id().equals(deck.id()) && (!existing.sealed() || !deck.sealed() || !existing.hash().equals(deck.hash())))
+                    throw new IllegalStateException("Deck UUID is already active or has conflicting contents");
+            if (!punchcardDevice(index).insert(deck)) throw new IllegalStateException("Transport occupied or incompatible deck");
+            if (deck.sealed()) savedPunchcards.put(deck.id(),deck.hash());
+            connectPunchcards(powered); publish(); return null;
+        });
+    }
+    public void collectPunchcard(int index) { call(() -> { punchcardDevice(index).collect(); publish(); return null; }); }
+    public boolean punchcardDirty(int index, boolean output) {
+        return call(() -> { var deck = output ? punchcardDevice(index).output() : punchcardDevice(index).active();
+            return deck != null && !deck.blankMedia() && !deck.hash().equals(savedPunchcards.get(deck.id())); });
+    }
+    public void savePunchcard(int index, boolean output, Path path) {
+        call(() -> {
+            var deck = output ? punchcardDevice(index).output() : punchcardDevice(index).active();
+            if (deck == null) throw new IllegalStateException("No deck");
+            deck.seal().save(path); savedPunchcards.put(deck.id(),deck.hash()); return null;
+        });
+    }
+    public void discardPunchcardChanges(int index, boolean output) {
+        call(() -> { var deck = output ? punchcardDevice(index).output() : punchcardDevice(index).active();
+            if (deck != null) savedPunchcards.put(deck.id(),deck.hash()); return null; });
+    }
+    private void connectPunchcards(boolean connected) {
+        for (int i=0;i<32;i++) cpu.hostBridge().submitPunchcardConnection(i>=16,i&15,connected ? punchcardDevice(i) : null);
+    }
+    private void writePunchcards(DataOutputStream out) throws IOException {
+        var decks = new java.util.LinkedHashMap<java.util.UUID,PunchcardDeck>();
+        for (int i=0;i<32;i++) for (var deck : new PunchcardDeck[]{punchcardDevice(i).active(),punchcardDevice(i).output()}) if (deck != null) {
+            var previous = decks.putIfAbsent(deck.id(),deck);
+            if (previous != null && !previous.hash().equals(deck.hash())) throw new IOException("Conflicting deck UUID");
+        }
+        out.writeInt(decks.size());
+        for (var deck : decks.values()) { deck.write(out); out.writeUTF(savedPunchcards.getOrDefault(deck.id(),"")); }
+        for (int i=0;i<32;i++) punchcardDevice(i).writeState(out);
+    }
+    private void readPunchcards(DataInputStream in) throws IOException {
+        int count = in.readInt(); if (count < 0 || count > 64) throw new IOException("Invalid media count");
+        var decks = new java.util.HashMap<java.util.UUID,PunchcardDeck>(); savedPunchcards.clear();
+        for (int i=0;i<count;i++) {
+            var deck = PunchcardDeck.read(in); String hash = in.readUTF();
+            if (decks.putIfAbsent(deck.id(),deck) != null || !hash.isEmpty() && !hash.matches("[0-9a-f]{64}")) throw new IOException("Invalid saved media");
+            if (!hash.isEmpty()) savedPunchcards.put(deck.id(),hash);
+        }
+        var owners = new java.util.HashSet<java.util.UUID>();
+        for (int i=0;i<32;i++) {
+            var device = PunchcardDevice.readState(in,decks::get);
+            if (device.writer != (i>=16) || device.active() != null && device.writer && !owners.add(device.active().id())) throw new IOException("Invalid transport ownership");
+            punchcardDevices[i] = device;
+        }
+    }
     public void selectKeyboard(int slot) {
         worker.execute(() -> command(() -> {
             if (slot < 0 || slot >= 8) throw new IllegalArgumentException("Keyboard slot: " + slot);
@@ -642,6 +733,7 @@ final class LauncherController implements DebuggerBackend {
     }
 
     static boolean writableIo(int port) {
+        if (port >= 0x8200 && port <= 0x89ff) return (port & 63) <= 0x20 || (port & 63) == 0x22;
         if (port < 0 || port > 0xFFFF) return false;
         if (port < 0x100) return (port & 1) == 1;
         if (port <= 0x80FF) return (port & 0xFF) < 0x80 || (port & 0xFF) == 0x81;
@@ -786,7 +878,7 @@ final class LauncherController implements DebuggerBackend {
                 Snapshot previous = lastPausedSnapshot;
                 Snapshot snapshot = new Snapshot(romName, status, previous.registers(), measuredRate, totalInstructions,
                         previous.memoryBase(), previous.memory(), previous.ioBase(), previous.io(), previous.code(),
-                        true, faulted, previous.devices().withKeyboard(selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard)), cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
+                        true, faulted, previous.devices().withKeyboard(selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard)).withPunchcard(selectedPunchcard,cpu.hostBridge().punchcardSnapshot(selectedPunchcard),cpu.hostBridge().punchcardName(selectedPunchcard)), cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
                 SwingUtilities.invokeLater(() -> onSnapshot.accept(snapshot));
                 return;
             }
@@ -805,7 +897,7 @@ final class LauncherController implements DebuggerBackend {
         byte[] storagePorts = readPorts(0x8160, 5);
         DeviceSnapshot devices = new DeviceSnapshot(selectedChannel, selectedSign, selectedTimer,
                 redstone, sign, timer, irq, storagePorts, cpu.hostBridge().timerAutomatic(selectedTimer), cpu.hostBridge().redstoneIrqMode(selectedChannel),
-                    cpu.hostBridge().signIrqSides(selectedSign), selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard));
+                    cpu.hostBridge().signIrqSides(selectedSign), selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard)).withPunchcard(selectedPunchcard,cpu.hostBridge().punchcardSnapshot(selectedPunchcard),cpu.hostBridge().punchcardName(selectedPunchcard));
             List<Disassembler8086.Instruction> code = new ArrayList<>();
             if (rom != null) for (int i = 0; i < 25; i++) {
                 var ins = Disassembler8086.decode(cpu.memory(), cs, ip);
@@ -882,6 +974,7 @@ final class LauncherController implements DebuggerBackend {
         return true;
     }
     private void connectKeyboards(boolean connected) {
+        connectPunchcards(connected);
         for (int slot = 0; slot < 8; slot++)
             cpu.hostBridge().submitKeyboardConnection(slot, connected && hardware.has(Hardware.KEYBOARD));
     }
@@ -951,7 +1044,7 @@ final class LauncherController implements DebuggerBackend {
             updateWorldTime();
             var buffer = new ByteArrayOutputStream();
             try (var out = new DataOutputStream(buffer)) {
-                out.writeInt(2); out.writeBoolean(rom != null); out.writeUTF(romName);
+                out.writeInt(3); out.writeBoolean(rom != null); out.writeUTF(romName);
                 out.writeUTF(romPath == null ? "" : romPath.toString()); out.writeBoolean(romUnavailable);
                 out.writeBoolean(powered); out.writeBoolean(psuHigh); out.writeBoolean(resume);
                 out.writeBoolean(faulted); out.writeShort(faultCs); out.writeShort(faultIp); out.writeUTF(status);
@@ -963,7 +1056,7 @@ final class LauncherController implements DebuggerBackend {
                 out.writeUTF(storagePath == null ? "" : storagePath.toString());
                 out.write(savedNvram); out.writeBoolean(savedStorage != null);
                 if (savedStorage != null) out.write(savedStorage);
-                byte[] core = cpu.saveState(); out.writeInt(core.length); out.write(core);
+                byte[] core = cpu.saveState(); out.writeInt(core.length); out.write(core); writePunchcards(out);
             }
             return buffer.toByteArray();
         });
@@ -972,10 +1065,10 @@ final class LauncherController implements DebuggerBackend {
     public boolean restoreSessionState(byte[] saved) {
         return call(() -> {
             requirePowerOff();
-            if (saved.length > 4 * 1024 * 1024) throw new IOException("Launcher CPU state exceeds 4 MiB");
+            if (saved.length > 8 * 1024 * 1024) throw new IOException("Launcher CPU state exceeds 8 MiB");
             try (var in = new DataInputStream(new ByteArrayInputStream(saved))) {
                 int version = in.readInt();
-                if (version < 1 || version > 2) throw new IOException("Unsupported launcher CPU state format");
+                if (version < 1 || version > 3) throw new IOException("Unsupported launcher CPU state format");
                 boolean hasRom = in.readBoolean(); romName = in.readUTF();
                 String romFile = in.readUTF(); romPath = romFile.isEmpty() ? null : Path.of(romFile);
                 romUnavailable = in.readBoolean();
@@ -999,6 +1092,7 @@ final class LauncherController implements DebuggerBackend {
                 int length = in.readInt();
                 if (length < 1 || length > 2 * 1024 * 1024) throw new IOException("Invalid core-state length");
                 byte[] core = new byte[length]; in.readFully(core);
+                if (version >= 3) readPunchcards(in); else { Arrays.fill(punchcardDevices,null); savedPunchcards.clear(); }
                 if (in.read() != -1 || totalInstructions < 0) throw new IOException("Invalid launcher CPU state");
                 sharedMemory = groups == null ? sharedMemory : groups.region(memoryId);
                 cpu = CPU8086.restoreState(core, sharedMemory); hardware = cpu.hardware();

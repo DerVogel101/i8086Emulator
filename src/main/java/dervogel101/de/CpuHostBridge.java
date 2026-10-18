@@ -25,6 +25,16 @@ public final class CpuHostBridge {
     public enum SignSide { FRONT, BACK }
 
     public void submitKeyboardConnection(int slot, boolean connected) { io.keyboards.connect(slot, connected); }
+    public void submitPunchcardConnection(boolean writer, int slot, dervogel101.de.i86.runtime.PunchcardDevice device) { io.punchcards.connect(writer, slot, device); }
+    public byte[] punchcardSnapshot(int index) {
+        if (index < 0 || index >= 32) throw new IllegalArgumentException("Punchcard slot");
+        return io.punchcards.snapshot(index);
+    }
+    public String punchcardName(int index) {
+        if (index < 0 || index >= 32) throw new IllegalArgumentException("Punchcard slot");
+        var device = io.punchcards.device(index>=16,index&15); var deck = device == null ? null : device.active();
+        return deck == null ? "" : deck.label();
+    }
     public boolean submitKeyboardInput(int slot, int value) { return io.keyboards.offer(slot, value); }
     public dervogel101.de.i86.runtime.KeyboardDevice.Snapshot keyboardSnapshot(int slot) { return io.keyboards.snapshot(slot); }
 
@@ -52,6 +62,7 @@ public final class CpuHostBridge {
     private final int[] signIrqSides = new int[128];
     private long lastGameTime;
     private long poweredOnGameTicks;
+    private long lastPunchcardTick = Long.MIN_VALUE;
     private boolean hasGameTime;
     private long dayTime;
     private boolean testPinHigh;
@@ -250,6 +261,7 @@ public final class CpuHostBridge {
     public void beforeTick() {
         beforeInstruction();
         io.keyboards.beforeTick(this::enqueueKeyboardIrq);
+        advancePunchcardTick();
         io.setIrqStatus(activeIrq, irqOverflow);
         if (!hardware.has(Hardware.CLOCK)) return;
         io.advanceTickTimers(poweredOnGameTicks, timerIrqs);
@@ -266,6 +278,15 @@ public final class CpuHostBridge {
         memory.updateRealtimeClock(LocalDateTime.ofInstant(now, clock.getZone()));
         io.setIrqStatus(activeIrq, irqOverflow);
     }
+    /** Paused standalone debuggers still have a ticking mechanical transport. */
+    public void servicePunchcardTick() {
+        beforeInstruction(); advancePunchcardTick(); io.setIrqStatus(activeIrq,irqOverflow);
+    }
+    private void advancePunchcardTick() {
+        if (!hasGameTime || poweredOnGameTicks != lastPunchcardTick) {
+            lastPunchcardTick = poweredOnGameTicks; io.punchcards.beforeTick(this::enqueueIrq);
+        }
+    }
 
     /** Apply inputs and device commands between steps without sampling clocks. */
     public void beforeInstruction() {
@@ -278,6 +299,7 @@ public final class CpuHostBridge {
         Runnable input;
         while ((input = pendingInputs.poll()) != null) input.run();
         io.keyboards.beforeInstruction(this::enqueueKeyboardIrq);
+        io.punchcards.beforeInstruction(this::enqueueIrq);
         io.serviceStorageCommand();
         io.sendTerminalIfPending(bytes -> { io.activity().mark(Hardware.TERMINAL, 1); appendTerminal(bytes); });
         io.setIrqStatus(activeIrq, irqOverflow);

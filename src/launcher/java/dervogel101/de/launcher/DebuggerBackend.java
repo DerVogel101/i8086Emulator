@@ -17,10 +17,20 @@ public interface DebuggerBackend extends AutoCloseable {
             DeviceSnapshot devices, String terminalLog, ImageState images, boolean testHigh, MachineState machine) {}
     record DeviceSnapshot(int channel, int signIndex, int timerIndex, byte[] redstone,
             byte[] sign, byte[] timer, byte[] irq, byte[] storage, boolean timerAutomatic, RedstoneIrqMode redstoneIrq, int signIrqSides,
-            int keyboardIndex, KeyboardDevice.Snapshot keyboard) {
+            int keyboardIndex, KeyboardDevice.Snapshot keyboard, int punchcardIndex, byte[] punchcard, String punchcardName) {
+        public DeviceSnapshot(int channel, int signIndex, int timerIndex, byte[] redstone, byte[] sign, byte[] timer, byte[] irq, byte[] storage,
+                              boolean automatic, RedstoneIrqMode mode, int sides, int keyboardIndex, KeyboardDevice.Snapshot keyboard) {
+            this(channel,signIndex,timerIndex,redstone,sign,timer,irq,storage,automatic,mode,sides,keyboardIndex,keyboard,0,new byte[64],"");
+        }
+        public DeviceSnapshot withPunchcard(int index, byte[] ports) {
+            return withPunchcard(index,ports,index == punchcardIndex ? punchcardName : "");
+        }
+        public DeviceSnapshot withPunchcard(int index, byte[] ports,String name) {
+            return new DeviceSnapshot(channel,signIndex,timerIndex,redstone,sign,timer,irq,storage,timerAutomatic,redstoneIrq,signIrqSides,keyboardIndex,keyboard,index,ports,name);
+        }
         public DeviceSnapshot withKeyboard(int index, KeyboardDevice.Snapshot snapshot) {
             return new DeviceSnapshot(channel, signIndex, timerIndex, redstone, sign, timer, irq, storage,
-                    timerAutomatic, redstoneIrq, signIrqSides, index, snapshot);
+                    timerAutomatic, redstoneIrq, signIrqSides, index, snapshot,punchcardIndex,punchcard,punchcardName);
         }
     }
     record MachineState(boolean powered, boolean psuHigh, HardwareProfile hardware, int shardTier, String memoryId, ShardSpeed speed) {
@@ -31,6 +41,18 @@ public interface DebuggerBackend extends AutoCloseable {
 
 
     void loadRom(Path path);
+    default void selectPunchcard(int index) { throw new UnsupportedOperationException("Punchcard selection unavailable"); }
+    default void punchcardCommand(int index,int command,String hex) { throw new UnsupportedOperationException("Punchcard commands unavailable"); }
+    default void punchcardCommand(int index,int command,String hex,int metadata) {
+        if (metadata != 0) throw new UnsupportedOperationException("Punchcard descriptions unavailable");
+        punchcardCommand(index,command,hex);
+    }
+    default PunchcardDeck punchcardMedia(int index, boolean output) { throw new UnsupportedOperationException("Use the Minecraft block for media"); }
+    default void insertPunchcard(int index, PunchcardDeck deck) { throw new UnsupportedOperationException("Use the Minecraft block for media"); }
+    default void collectPunchcard(int index) { throw new UnsupportedOperationException("Use the Minecraft block for media"); }
+    default boolean punchcardDirty(int index, boolean output) { return false; }
+    default void savePunchcard(int index, boolean output, Path path) { throw new UnsupportedOperationException("Deck files are standalone only"); }
+    default void discardPunchcardChanges(int index, boolean output) { throw new UnsupportedOperationException("Deck files are standalone only"); }
     void configure(int instructions, int ticks);
     void configure(int instructions, int ticks, int batches);
     void run();

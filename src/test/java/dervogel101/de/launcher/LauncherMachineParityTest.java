@@ -29,7 +29,10 @@ class LauncherMachineParityTest {
             restored.configureMachine(HardwareProfile.complete(), 0, "tier_test");
             assertFalse(restored.inspectMachine().shardPresent());
         }
-        byte[] oldFormat = state.clone(); oldFormat[3] = 1;
+        var media = new java.io.ByteArrayOutputStream();
+        var mediaOut = new java.io.DataOutputStream(media); mediaOut.writeInt(0);
+        for (int i=0;i<32;i++) new PunchcardDevice(i>=16).writeState(mediaOut);
+        byte[] oldFormat = java.util.Arrays.copyOf(state,state.length-media.size()); oldFormat[3] = 1;
         try (var legacy = new LauncherController(snapshot -> {}, error -> fail(error))) {
             legacy.restoreSessionState(oldFormat);
             assertEquals(3, legacy.inspectMachine().shardTier());

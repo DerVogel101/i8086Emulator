@@ -195,7 +195,7 @@ public class CPU8086 {
         beforeInstruction();
         var buffer = new ByteArrayOutputStream();
         try (var out = new DataOutputStream(buffer)) {
-            out.writeInt(0x49383653); out.writeInt(2);
+            out.writeInt(0x49383653); out.writeInt(3);
             for (Hardware device : Hardware.values()) out.writeByte(hardware.count(device));
             out.writeShort(registers.getAx());
             out.writeShort(registers.getBx());
@@ -226,10 +226,10 @@ public class CPU8086 {
         try (var in = new DataInputStream(new ByteArrayInputStream(state))) {
             if (in.readInt() != 0x49383653) throw new IOException("Unsupported CPU state format");
             int version = in.readInt();
-            if (version < 1 || version > 2) throw new IOException("Unsupported CPU state format");
+            if (version < 1 || version > 3) throw new IOException("Unsupported CPU state format");
             var counts = new EnumMap<Hardware, Integer>(Hardware.class);
             for (Hardware device : Hardware.values())
-                if (version >= 2 || device != Hardware.KEYBOARD) counts.put(device, in.readUnsignedByte());
+                if ((version >= 2 || device != Hardware.KEYBOARD) && (version >= 3 || device != Hardware.PUNCHCARD)) counts.put(device, in.readUnsignedByte());
             CPU8086 next = new CPU8086(clock, sharedMemory);
             next.configureHardware(new HardwareProfile(counts));
             next.registers.setAx(in.readUnsignedShort());

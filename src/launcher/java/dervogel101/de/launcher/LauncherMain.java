@@ -35,6 +35,7 @@ public final class LauncherMain {
     private final ByteViewPanel memoryView;
     private final ByteViewPanel ioView;
     private final DeviceViewPanel deviceView;
+    private final PunchcardPanel punchcardView;
     private final List<CpuSlot> slots = new ArrayList<>();
     private final JComboBox<CpuSlot> cpuSelector = new JComboBox<>();
     private final JLabel nvramStatus = new JLabel("NVRAM: unsaved");
@@ -83,6 +84,7 @@ public final class LauncherMain {
                 (port, value) -> selected().writeIo(port, value), LauncherController::writableIo);
         deviceView = new DeviceViewPanel(this::selected, this::openStorage, this::newStorage,
                 () -> saveStorage(false), () -> saveStorage(true), this::disconnectStorage);
+        punchcardView = new PunchcardPanel(this::selected,remote);
         build();
     }
 
@@ -205,6 +207,7 @@ public final class LauncherMain {
 
         tabs.addTab("Memory", memoryPanel());
         tabs.addTab("I/O", ioPanel());
+        tabs.addTab("Punchcards",punchcardView);
         tabs.addTab("Instructions", codePanel());
         terminalLog.setEditable(false);
         terminalLog.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
@@ -324,6 +327,7 @@ public final class LauncherMain {
         memoryView.update(snapshot.memoryBase(), snapshot.memory(), loaded);
         ioView.update(snapshot.ioBase(), snapshot.io(), loaded);
         deviceView.update(snapshot.devices(), snapshot.images(), loaded, snapshot.machine());
+        punchcardView.update(snapshot);
         testPinControl.setSelected(snapshot.testHigh());
         nvramStatus.setText(remote ? "NVRAM: managed by Minecraft" : "NVRAM: " + (snapshot.images().nvramPath() == null
                 ? "Unsaved" : snapshot.images().nvramPath().getFileName())
@@ -451,6 +455,8 @@ public final class LauncherMain {
     }
 
     private boolean confirmDirty(List<DebuggerBackend> cpus, boolean nvram, boolean storage) {
+        if (nvram && storage) for (var cpu : cpus) if (!cpu.remote()) for (int index=0;index<32;index++)
+            for (boolean output : new boolean[]{false,true}) if (!PunchcardPanel.confirmMedia(frame,cpu,index,output)) return false;
         return ImageTransitions.resolve(cpus, nvram, storage, new ImageTransitions.Prompt() {
             @Override public ImageTransitions.Decision decide(DebuggerBackend cpu, ImageTransitions.Kind kind) {
                 int id = slots.stream().filter(slot -> slot.controller == cpu).findFirst().orElseThrow().id;

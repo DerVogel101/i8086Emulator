@@ -28,7 +28,7 @@ final class LauncherSession {
         try {
             var ids = new HashSet<Integer>();
             try (var out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(temporary)))) {
-                out.writeInt(MAGIC); out.writeInt(2); out.writeLong(state.ticks); out.writeInt(state.tickRate); out.writeInt(state.nextCpuId);
+                out.writeInt(MAGIC); out.writeInt(3); out.writeLong(state.ticks); out.writeInt(state.tickRate); out.writeInt(state.nextCpuId);
                 for (ShardSpeed shard : state.shards) { out.writeInt(shard.stepsPerTick()); out.writeInt(shard.batchesPerTick()); }
                 out.writeInt(state.regions.size());
                 var names = new HashSet<String>();
@@ -41,7 +41,7 @@ final class LauncherSession {
                 out.writeInt(state.cpus.size());
                 for (Cpu cpu : state.cpus) {
                     if (cpu.id < 1 || cpu.id >= state.nextCpuId || !ids.add(cpu.id)
-                            || cpu.state.length < 1 || cpu.state.length > 4 * 1024 * 1024)
+                            || cpu.state.length < 1 || cpu.state.length > 8 * 1024 * 1024)
                         throw new IOException("Invalid CPU session record");
                     out.writeInt(cpu.id); out.writeInt(cpu.state.length); out.write(cpu.state);
                 }
@@ -57,7 +57,7 @@ final class LauncherSession {
         try (var in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
             if (in.readInt() != MAGIC) throw new IOException("Unsupported session format");
             int version = in.readInt();
-            if (version < 1 || version > 2) throw new IOException("Unsupported session format");
+            if (version < 1 || version > 3) throw new IOException("Unsupported session format");
             long ticks = in.readLong(); int tickRate = in.readInt(), nextCpuId = in.readInt();
             if (ticks < 0 || tickRate < 1 || tickRate > 1000 || nextCpuId < 1) throw new IOException("Invalid saved clock or ID counter");
             var shards = version == 1 ? List.of(ShardSpeed.TIER_1, ShardSpeed.TIER_2, ShardSpeed.TIER_3)
@@ -77,7 +77,7 @@ final class LauncherSession {
             var ids = new HashSet<Integer>();
             for (int i = 0; i < count; i++) {
                 int id = in.readInt(), length = in.readInt();
-                if (id < 1 || id >= nextCpuId || !ids.add(id) || length < 1 || length > 4 * 1024 * 1024)
+                if (id < 1 || id >= nextCpuId || !ids.add(id) || length < 1 || length > 8 * 1024 * 1024)
                     throw new IOException("Invalid CPU session record");
                 byte[] bytes = new byte[length]; in.readFully(bytes); cpus.add(new Cpu(id, bytes));
             }

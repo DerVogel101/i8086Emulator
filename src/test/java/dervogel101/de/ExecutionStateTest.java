@@ -18,11 +18,11 @@ class ExecutionStateTest {
         cpu.registers().setIp(0x5678);
         cpu.memory().write8(0, 0x1000, 0xab);
         byte[] current = cpu.saveState();
-        assertEquals(2, current[7]);
+        assertEquals(3, current[7]);
         int keyboardCount = 8 + Hardware.KEYBOARD.ordinal();
-        byte[] legacy = new byte[current.length - 1];
+        byte[] legacy = new byte[current.length - 2];
         System.arraycopy(current, 0, legacy, 0, keyboardCount);
-        System.arraycopy(current, keyboardCount + 1, legacy, keyboardCount, current.length - keyboardCount - 1);
+        System.arraycopy(current, keyboardCount + 2, legacy, keyboardCount, current.length - keyboardCount - 2);
         legacy[7] = 1;
         var restored = CPU8086.restoreState(legacy, FIXED, new SharedMemoryRegion());
         assertEquals(cpu.hardware(), restored.hardware());
