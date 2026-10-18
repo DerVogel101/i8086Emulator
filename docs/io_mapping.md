@@ -10,13 +10,15 @@
 | `0x8130`–`0x8150` | Output terminal       | 32 character bytes and send control   |
 | `0x8151`–`0x815F` | Unassigned            | Reads return zero; writes are ignored |
 | `0x8160`–`0x8164` | Nonvolatile storage   | Data, word address, command/status    |
-| `0x8165`–`0xFEFF` | Unassigned            | Reads return zero; writes are ignored |
+| `0x8165`–`0x816F` | Unassigned            | Reads return zero; writes are ignored |
+| `0x8170`-`0x817F` | Eight keyboards       | Two ports per slot                    |
+| `0x8180`–`0xFEFF` | Unassigned            | Reads return zero; writes are ignored |
 | `0xFF00`–`0xFF02` | IRQ queue             | Active device ID and control/status   |
 | `0xFF03`–`0xFFFF` | Unassigned            | Reads return zero; writes are ignored |
 
 ## IRQ queue
 
-The 16-bit device ID has an 8-bit type in its high byte and an 8-bit index in its low byte. Types `0`, `1`, `2`, and `3` identify redstone, signs, real-time timers, and Minecraft timers respectively. For example, sign 0 is `0x0100`, real-time timer 0 is `0x0200`, and Minecraft timer 0 is `0x0300`. The host explicitly calls `submitIrq(type, index)` or the compatible raw-ID overload; redstone and sign input updates generate IRQs only when explicitly configured. Redstone modes default to DISABLED and sign sides default to none. Use `submitRedstoneIrqMode(channel, mode)` and `submitSignIrqSides(sign, sides)` (bit 0 front, bit 1 back); redstone modes HIGH/LOW/BOTH use zero/nonzero transitions, while ANALOG uses every level change. `submitRedstoneInput(channel, strength, false)` silently resamples a reconnecting port. All device IRQs are suppressed without the Interrupt Controller. The active event asserts maskable INTR until acknowledged; see [cpu_execution.md](cpu_execution.md#host-execution-and-persistence) for interrupt delivery. The queue holds 256 events including the active one. If full, a new event replaces the oldest waiting event and sets overflow; the active ID never changes until ACK.
+The 16-bit device ID has an 8-bit type in its high byte and an 8-bit index in its low byte. Types `0`, `1`, `2`, `3`, and `4` identify redstone, signs, real-time timers, Minecraft timers, and keyboards respectively. For example, sign 0 is `0x0100`, real-time timer 0 is `0x0200`, and Minecraft timer 0 is `0x0300`. The host explicitly calls `submitIrq(type, index)` or the compatible raw-ID overload; redstone and sign input updates generate IRQs only when explicitly configured. Redstone modes default to DISABLED and sign sides default to none. Use `submitRedstoneIrqMode(channel, mode)` and `submitSignIrqSides(sign, sides)` (bit 0 front, bit 1 back); redstone modes HIGH/LOW/BOTH use zero/nonzero transitions, while ANALOG uses every level change. `submitRedstoneInput(channel, strength, false)` silently resamples a reconnecting port. All device IRQs are suppressed without the Interrupt Controller. The active event asserts maskable INTR until acknowledged; see [cpu_execution.md](cpu_execution.md#host-execution-and-persistence) for interrupt delivery. The queue holds 256 events including the active one. If full, a new event replaces the oldest waiting event and sets overflow; the active ID never changes until ACK.
 
 | Port     | Read                                         | Write                                                           |
 |----------|----------------------------------------------|-----------------------------------------------------------------|
@@ -25,6 +27,32 @@ The 16-bit device ID has an 8-bit type in its high byte and an 8-bit index in it
 | `0xFF02` | Bit 1: event pending; bit 2: sticky overflow | Write one to bit 0 to ACK; write one to bit 2 to clear overflow |
 
 The pending bit distinguishes an empty queue from device ID zero. ACK and overflow-clear commands take effect at the next `beforeInstruction()` boundary; the next waiting ID is then published. Overflow is cleared before new submissions at that boundary, so a fresh overflow remains visible. CPU RESET preserves the queue and overflow state.
+
+## Keyboards
+
+Eight keyboard slots use `0x8170` through `0x817F`, two byte ports per slot. Slot `n` has base `0x8170 + 2*n`.
+
+| Offset | Read                                       | Write                      |
+|--------|--------------------------------------------|----------------------------|
+| `+0`   | Current character byte, or zero when empty | Ignored                    |
+| `+1`   | Bit 0: ACK pending; bit 1: character ready | Write bit 0 to request ACK |
+
+Each slot holds eight bytes including its visible head. Host admission is bounded and thread-safe; a full queue drops the new byte. The first character becomes visible at the next instruction boundary and generates IRQ ID `0x0400 | n`. Waiting characters generate no IRQ until published.
+
+An ACK is confirmed at the next instruction boundary by setting ACK-pending. The byte remains readable until the next game-tick boundary, which removes exactly one acknowledged character, clears ACK-pending, and presents the next byte with its IRQ. Repeated ACKs while pending count once; ACK with no ready character does nothing. Instruction and batch boundaries alone do not consume input. The global IRQ queue's ACK never consumes keyboard data.
+
+Keyboard ports require the optional Keyboard Controller. Without it, reads return zero and writes are ignored. Without an Interrupt Controller, polling still works but keyboard IRQs are suppressed. CPU RESET preserves input and pending ACKs. Device detach/unload and mainframe shutdown clear the affected FIFO; leaving input capture preserves it. FIFO contents are not restored from saved execution snapshots.
+
+Text uses Windows-1258. Unmodified Backspace, Tab and Enter are `0x08`, `0x09` and `0x0A`. Standard DE/US Shift, Caps Lock and German AltGr are supported through stateless physical-key maps; dead accents do not compose. Modified control/navigation/numpad combinations and Ctrl/Alt shortcuts are ignored.
+
+| Codes                 | Special keys, in order                                         |
+|-----------------------|----------------------------------------------------------------|
+| `0x81` through `0x8A` | Numpad 0 through 9                                             |
+| `0x8B` through `0x91` | Numpad decimal, divide, multiply, subtract, add, Enter, equals |
+| `0x92` through `0x95` | Left, Right, Up, Down                                          |
+| `0x96` through `0x9B` | Insert, Delete, Home, End, Page Up, Page Down                  |
+
+These special codes replace characters unreachable through standard DE/US typing. Num Lock does not alter them; main-section operators remain text, and euro remains `0x80`. The C hardware library exports the port/bit macros and `IRQ_DEVICE_KEYBOARD`; `keyboard.h` adds key constants, nonblocking reads and IRQ-manager bindings.
 
 ## Timers
 

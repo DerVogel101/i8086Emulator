@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.function.Consumer;
 
 public class CPUIO {
+    public final dervogel101.de.i86.runtime.KeyboardDevice keyboards = new dervogel101.de.i86.runtime.KeyboardDevice();
     private static final int SIGN_FIRST = 0x0100;
     private static final int SIGN_LAST = 0x80FF;
     private static final int SIGN_COUNT = 128;
@@ -50,9 +51,11 @@ public class CPUIO {
 
     public synchronized void configureHardware(HardwareProfile profile) {
         hardware = profile;
+        keyboards.enabled(profile.has(Hardware.KEYBOARD));
     }
 
     private boolean available(int port) {
+        if (port >= 0x8170 && port <= 0x817F) return hardware.has(Hardware.KEYBOARD);
         if (port < SIGN_FIRST) return (port >>> 1) < hardware.redstoneCapacity();
         if (port <= SIGN_LAST) return ((port - SIGN_FIRST) >>> 8) < hardware.signCapacity();
         if (port >= TIMER_FIRST && port <= TIMER_LAST) return hardware.has(Hardware.CLOCK);
@@ -77,6 +80,7 @@ public class CPUIO {
     public synchronized int read8(int port) {
         port &= 0xFFFF;
         if (!available(port)) return 0;
+        if (port >= 0x8170 && port <= 0x817F) return keyboards.read(port - 0x8170);
         if (port == IRQ_FIRST) return irqPending ? irqId & 0xFF : 0;
         if (port == IRQ_FIRST + 1) return irqPending ? irqId >>> 8 : 0;
         if (port == IRQ_FIRST + 2) return (irqPending ? 2 : 0) | (irqOverflow ? 4 : 0);
@@ -114,6 +118,7 @@ public class CPUIO {
     public synchronized void write8(int port, int value) {
         port &= 0xFFFF;
         if (!available(port)) return;
+        if (port >= 0x8170 && port <= 0x817F) { keyboards.write(port - 0x8170, value); return; }
         if (port == IRQ_FIRST + 2) {
             irqCommands |= value & 5;
             return;

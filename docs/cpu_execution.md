@@ -104,10 +104,12 @@ state, terminal history, HLT, and the instruction interrupt shadow. Pending host
 inputs are applied at the save boundary. Shared-memory bytes belong to the host's
 region table and are saved once, rather than once per CPU. A save/reopen is a
 suspension, not a power cycle. Invalid or truncated state fails explicitly.
+Snapshot format 2 adds the Keyboard Controller count; format-1 snapshots still
+load with that controller absent. Keyboard FIFOs and capture leases are transient.
 
 The host configures installed hardware with `configureHardware(HardwareProfile)`
-only while powered off. The default profile includes every device and maximum
-port capacities for existing callers. Absent clock, timer, NVRAM, shared-memory,
+only while powered off. The default profile retains the legacy devices and maximum
+port capacities; the Keyboard Controller must be added explicitly. Absent clock, timer, NVRAM, shared-memory,
 terminal, disk, IRQ and excess port ranges return zero or ignore writes. Hidden
 retained NVRAM and shared bytes are not erased. NMI remains independent of the
 optional device Interrupt Controller. Hardware profiles and port IRQ settings

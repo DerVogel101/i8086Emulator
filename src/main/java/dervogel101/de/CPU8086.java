@@ -195,7 +195,7 @@ public class CPU8086 {
         beforeInstruction();
         var buffer = new ByteArrayOutputStream();
         try (var out = new DataOutputStream(buffer)) {
-            out.writeInt(0x49383653); out.writeInt(1);
+            out.writeInt(0x49383653); out.writeInt(2);
             for (Hardware device : Hardware.values()) out.writeByte(hardware.count(device));
             out.writeShort(registers.getAx());
             out.writeShort(registers.getBx());
@@ -224,9 +224,12 @@ public class CPU8086 {
     public static CPU8086 restoreState(byte[] state, Clock clock, SharedMemoryRegion sharedMemory) throws IOException {
         if (state.length > 2 * 1024 * 1024) throw new IOException("CPU state exceeds 2 MiB");
         try (var in = new DataInputStream(new ByteArrayInputStream(state))) {
-            if (in.readInt() != 0x49383653 || in.readInt() != 1) throw new IOException("Unsupported CPU state format");
+            if (in.readInt() != 0x49383653) throw new IOException("Unsupported CPU state format");
+            int version = in.readInt();
+            if (version < 1 || version > 2) throw new IOException("Unsupported CPU state format");
             var counts = new EnumMap<Hardware, Integer>(Hardware.class);
-            for (Hardware device : Hardware.values()) counts.put(device, in.readUnsignedByte());
+            for (Hardware device : Hardware.values())
+                if (version >= 2 || device != Hardware.KEYBOARD) counts.put(device, in.readUnsignedByte());
             CPU8086 next = new CPU8086(clock, sharedMemory);
             next.configureHardware(new HardwareProfile(counts));
             next.registers.setAx(in.readUnsignedShort());

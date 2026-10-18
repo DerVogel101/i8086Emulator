@@ -2,6 +2,7 @@ package dervogel101.de;
 
 import dervogel101.de.state.*;
 import dervogel101.de.i86.runtime.RedstoneIrqMode;
+import dervogel101.de.i86.runtime.Hardware;
 import java.io.IOException;
 import java.time.*;
 import java.util.Arrays;
@@ -10,6 +11,26 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ExecutionStateTest {
     private static final Clock FIXED = Clock.fixed(Instant.ofEpochMilli(1000), ZoneOffset.UTC);
+
+    @Test void legacyStateWithoutKeyboardHardwareStillRestores() throws Exception {
+        var cpu = new CPU8086(FIXED);
+        cpu.registers().setAx(0x1234);
+        cpu.registers().setIp(0x5678);
+        cpu.memory().write8(0, 0x1000, 0xab);
+        byte[] current = cpu.saveState();
+        assertEquals(2, current[7]);
+        int keyboardCount = 8 + Hardware.KEYBOARD.ordinal();
+        byte[] legacy = new byte[current.length - 1];
+        System.arraycopy(current, 0, legacy, 0, keyboardCount);
+        System.arraycopy(current, keyboardCount + 1, legacy, keyboardCount, current.length - keyboardCount - 1);
+        legacy[7] = 1;
+        var restored = CPU8086.restoreState(legacy, FIXED, new SharedMemoryRegion());
+        assertEquals(cpu.hardware(), restored.hardware());
+        assertEquals(0, restored.hardware().keyboardCapacity());
+        assertEquals(0x1234, restored.registers().getAx());
+        assertEquals(0x5678, restored.registers().getIp());
+        assertEquals(0xab, restored.memory().read8(0, 0x1000));
+    }
 
     @Test void roundTripPreservesExecutionDevicesDirtyWritesAndPendingPins() throws Exception {
         var region = new SharedMemoryRegion();

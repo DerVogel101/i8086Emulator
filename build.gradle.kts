@@ -43,6 +43,12 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    val editorRom = providers.environmentVariable("KEYBOARD_EDITOR_ROM").orNull
+    inputs.property("keyboardEditorRom", editorRom ?: "<unset>")
+    if (!editorRom.isNullOrBlank()) inputs.file(file(editorRom)).withPropertyName("keyboardEditorRomImage")
+    val keyboardRom = providers.environmentVariable("KEYBOARD_TEST_ROM").orNull
+    inputs.property("keyboardTestRom", keyboardRom ?: "<unset>")
+    if (!keyboardRom.isNullOrBlank()) inputs.file(file(keyboardRom)).withPropertyName("keyboardTestRomImage")
     val irqRom = providers.environmentVariable("IRQ_HANDLER_TEST_ROM").orNull
     inputs.property("irqHandlerTestRom", irqRom ?: "<unset>")
     if (!irqRom.isNullOrBlank()) {

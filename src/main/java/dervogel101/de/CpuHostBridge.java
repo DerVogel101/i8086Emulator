@@ -24,6 +24,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public final class CpuHostBridge {
     public enum SignSide { FRONT, BACK }
 
+    public void submitKeyboardConnection(int slot, boolean connected) { io.keyboards.connect(slot, connected); }
+    public boolean submitKeyboardInput(int slot, int value) { return io.keyboards.offer(slot, value); }
+
     private static final int TERMINAL_CAPACITY = 16_384;
     private static final Charset WINDOWS_1252 = Charset.forName("windows-1252");
 
@@ -245,6 +248,8 @@ public final class CpuHostBridge {
     /** Sample world time and advance game-tick timers once per host tick. */
     public void beforeTick() {
         beforeInstruction();
+        io.keyboards.beforeTick(this::enqueueKeyboardIrq);
+        io.setIrqStatus(activeIrq, irqOverflow);
         if (!hardware.has(Hardware.CLOCK)) return;
         io.advanceTickTimers(poweredOnGameTicks, timerIrqs);
         memory.updateTickClock(poweredOnGameTicks, dayTime);
@@ -271,9 +276,15 @@ public final class CpuHostBridge {
         }
         Runnable input;
         while ((input = pendingInputs.poll()) != null) input.run();
+        io.keyboards.beforeInstruction(this::enqueueKeyboardIrq);
         io.serviceStorageCommand();
         io.sendTerminalIfPending(bytes -> { io.activity().mark(Hardware.TERMINAL, 1); appendTerminal(bytes); });
         io.setIrqStatus(activeIrq, irqOverflow);
+    }
+
+    private void enqueueKeyboardIrq(int id) {
+        io.activity().mark(Hardware.KEYBOARD, 1);
+        enqueueIrq(id);
     }
 
     private synchronized void appendTerminal(byte[] bytes) {
