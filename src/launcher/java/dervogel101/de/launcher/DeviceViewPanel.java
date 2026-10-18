@@ -12,6 +12,7 @@ import java.util.function.Supplier;
 /** Labeled controls for the existing port map. CPU access stays in DebuggerBackend. */
 final class DeviceViewPanel extends JTabbedPane {
     private final Supplier<DebuggerBackend> controller;
+    private final KeyboardViewPanel keyboard;
     private final Runnable openStorage, newStorage, saveStorage, saveStorageAs, disconnectStorage;
     private final JLabel storageStatus = new JLabel("Disconnected");
     private final JLabel storageRegisters = new JLabel("Data: 0000  Address: 0000  Control: 00");
@@ -50,7 +51,9 @@ final class DeviceViewPanel extends JTabbedPane {
         this.saveStorage = saveStorage;
         this.saveStorageAs = saveStorageAs;
         this.disconnectStorage = disconnectStorage;
+        keyboard = new KeyboardViewPanel(controller);
         addTab("Redstone", redstonePanel());
+        addTab("Keyboard", keyboard);
         addTab("Signs", signPanel());
         addTab("Timers", timerPanel());
         addTab("IRQ queue", irqPanel());
@@ -69,6 +72,7 @@ final class DeviceViewPanel extends JTabbedPane {
     }
 
     void resetForCpu() {
+        keyboard.stopCapture();
         syncing = true;
         for (JTextField line : signLines) line.setText("");
         Arrays.fill(signDirty, false);
@@ -176,11 +180,14 @@ final class DeviceViewPanel extends JTabbedPane {
                 controller.get().sendIrq(id);
             } catch (NumberFormatException error) { JOptionPane.showMessageDialog(this, "Enter a 16-bit hex device ID."); }
         })));
-        panel.add(row(new JLabel("IDs: redstone 00xx, sign 01xx, real timer 02xx, game timer 03xx.")));
+        panel.add(row(new JLabel("IDs: redstone 00xx, sign 01xx, real timer 02xx, game timer 03xx, keyboard 0400–0407.")));
         return panel;
     }
 
-    void update(DebuggerBackend.DeviceSnapshot devices, DebuggerBackend.ImageState images, boolean loaded) {
+    void update(DebuggerBackend.DeviceSnapshot devices, DebuggerBackend.ImageState images, boolean loaded, DebuggerBackend.MachineState machine) {
+        boolean installed = machine.hardware().has(dervogel101.de.i86.runtime.Hardware.KEYBOARD);
+        keyboard.update(devices.keyboardIndex(), devices.keyboard(), controller.get().canControl() && machine.powered()
+                && installed && devices.keyboard().connected(), controller.get().canEdit() && machine.powered(), installed);
         if (controller.get().remote()) loaded &= controller.get().canEdit();
         this.loaded = loaded;
         if (controller.get().remote()) {

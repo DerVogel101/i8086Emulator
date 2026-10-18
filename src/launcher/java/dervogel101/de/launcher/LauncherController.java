@@ -96,7 +96,7 @@ final class LauncherController implements DebuggerBackend {
     private int ioBase;
     private int codeCs = 0xFFFF, codeIp;
     private boolean followPc = true;
-    private int selectedChannel, selectedSign, selectedTimer;
+    private int selectedChannel, selectedSign, selectedTimer, selectedKeyboard;
     private long gameTime;
     private long lastSubmittedGameTime = Long.MIN_VALUE;
     private long rateInstructions, rateStart = System.nanoTime(), measuredRate;
@@ -515,7 +515,7 @@ final class LauncherController implements DebuggerBackend {
         codeCs = 0xFFFF; codeIp = 0;
         memoryBase = 0xFFF00;
         ioBase = 0;
-        selectedChannel = selectedSign = selectedTimer = 0;
+        selectedChannel = selectedSign = selectedTimer = selectedKeyboard = 0;
         gameTime = rateInstructions = measuredRate = totalInstructions = 0;
         lastSubmittedGameTime = Long.MIN_VALUE;
         rateStart = System.nanoTime();
@@ -554,6 +554,21 @@ final class LauncherController implements DebuggerBackend {
         selectedSign = sign;
     })); }
 
+    public void selectKeyboard(int slot) {
+        worker.execute(() -> command(() -> {
+            if (slot < 0 || slot >= 8) throw new IllegalArgumentException("Keyboard slot: " + slot);
+            selectedKeyboard = slot;
+        }));
+    }
+    public void keyboardInput(int slot, int value) {
+        worker.execute(() -> command(() -> {
+            if (slot < 0 || slot >= 8 || !dervogel101.de.i86.runtime.KeyboardInput.allowedByte(value))
+                throw new IllegalArgumentException("Invalid keyboard input");
+            if (!powered || !hardware.has(Hardware.KEYBOARD)) throw new IllegalStateException("Keyboard controller is offline");
+            if (!cpu.hostBridge().submitKeyboardInput(slot, value)) throw new IllegalStateException("Keyboard FIFO is full");
+            if (!running) cpu.beforeInstruction();
+        }));
+    }
     public void selectTimer(int timer) { worker.execute(() -> command(() -> {
         if (timer < 0 || timer >= 6) throw new IllegalArgumentException("Timer index: " + timer);
         selectedTimer = timer;
@@ -633,6 +648,7 @@ final class LauncherController implements DebuggerBackend {
         if (port <= 0x812F) { int offset = (port - 0x8100) & 7; return offset >= 2 && offset <= 4; }
         if (port <= 0x8150) return true;
         if (port >= 0x8160 && port <= 0x8164) return true;
+        if (port >= 0x8170 && port <= 0x817f) return (port & 1) != 0;
         return port == 0xFF02;
     }
 
@@ -770,7 +786,7 @@ final class LauncherController implements DebuggerBackend {
                 Snapshot previous = lastPausedSnapshot;
                 Snapshot snapshot = new Snapshot(romName, status, previous.registers(), measuredRate, totalInstructions,
                         previous.memoryBase(), previous.memory(), previous.ioBase(), previous.io(), previous.code(),
-                        true, faulted, previous.devices(), cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
+                        true, faulted, previous.devices().withKeyboard(selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard)), cpu.hostBridge().terminalText(), imageState(), testHigh, machineState());
                 SwingUtilities.invokeLater(() -> onSnapshot.accept(snapshot));
                 return;
             }
@@ -789,7 +805,7 @@ final class LauncherController implements DebuggerBackend {
         byte[] storagePorts = readPorts(0x8160, 5);
         DeviceSnapshot devices = new DeviceSnapshot(selectedChannel, selectedSign, selectedTimer,
                 redstone, sign, timer, irq, storagePorts, cpu.hostBridge().timerAutomatic(selectedTimer), cpu.hostBridge().redstoneIrqMode(selectedChannel),
-                    cpu.hostBridge().signIrqSides(selectedSign));
+                    cpu.hostBridge().signIrqSides(selectedSign), selectedKeyboard, cpu.hostBridge().keyboardSnapshot(selectedKeyboard));
             List<Disassembler8086.Instruction> code = new ArrayList<>();
             if (rom != null) for (int i = 0; i < 25; i++) {
                 var ins = Disassembler8086.decode(cpu.memory(), cs, ip);
@@ -848,6 +864,7 @@ final class LauncherController implements DebuggerBackend {
             if (groups != null) groups.powerOff(mainframeId);
         }
         powered = false;
+        connectKeyboards(false);
     }
 
     private boolean ensurePowered() {
@@ -861,7 +878,12 @@ final class LauncherController implements DebuggerBackend {
             cpu = newCpu(); cpu.hostBridge().loadRom(rom); resetView(); needsColdStart = false;
         }
         powered = true;
+        connectKeyboards(true);
         return true;
+    }
+    private void connectKeyboards(boolean connected) {
+        for (int slot = 0; slot < 8; slot++)
+            cpu.hostBridge().submitKeyboardConnection(slot, connected && hardware.has(Hardware.KEYBOARD));
     }
 
     public void powerSupply(boolean high) {
@@ -986,6 +1008,7 @@ final class LauncherController implements DebuggerBackend {
                         || resume && (!savedPowered || faulted)) throw new IOException("Inconsistent power state");
                 if (storage != null && savedStorage == null) throw new IOException("Missing storage baseline");
                 powered = savedPowered;
+                connectKeyboards(powered);
                 if (powered && groups != null && hardware.has(Hardware.SHARED_MEMORY)) groups.powerOn(mainframeId, memoryId);
                 running = false; lastPausedSnapshot = null; lastSubmittedGameTime = Long.MIN_VALUE;
                 followPc = true; publish(); return resume;

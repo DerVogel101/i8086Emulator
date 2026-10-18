@@ -117,6 +117,15 @@ are included in execution snapshots.
 
 ## Standalone launcher
 
+The **I/O → Devices → Keyboard** tab selects slots 0–7 and shows the bounded FIFO,
+presented byte, READY and ACK-pending flags. Install the optional Keyboard Controller
+in the powered-off **Hardware** dialog to enable eight virtual keyboards. Click
+**Capture keys** and select DE/US to type, including arrows and numpad codes; Escape
+or leaving the capture area releases input. Typing works while the ROM runs.
+The data ACK control remains separate from the IRQ queue ACK. Power-off clears
+virtual input; CPU RESET preserves it. Session restore reconnects the virtual
+keyboards with empty queues, following the transient-input snapshot contract.
+
 The launcher and mod compile the same Minecraft-independent rules from the
 sibling `emulator_i86_crafted/src/runtime/java` directory. The launcher also uses
 that checkout's bundled sign font and OFL notices. Keep both checkouts side by side.

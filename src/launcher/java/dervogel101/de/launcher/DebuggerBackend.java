@@ -16,7 +16,13 @@ public interface DebuggerBackend extends AutoCloseable {
                     List<Disassembler8086.Instruction> code, boolean running, boolean faulted,
             DeviceSnapshot devices, String terminalLog, ImageState images, boolean testHigh, MachineState machine) {}
     record DeviceSnapshot(int channel, int signIndex, int timerIndex, byte[] redstone,
-                          byte[] sign, byte[] timer, byte[] irq, byte[] storage, boolean timerAutomatic, RedstoneIrqMode redstoneIrq, int signIrqSides) {}
+            byte[] sign, byte[] timer, byte[] irq, byte[] storage, boolean timerAutomatic, RedstoneIrqMode redstoneIrq, int signIrqSides,
+            int keyboardIndex, KeyboardDevice.Snapshot keyboard) {
+        public DeviceSnapshot withKeyboard(int index, KeyboardDevice.Snapshot snapshot) {
+            return new DeviceSnapshot(channel, signIndex, timerIndex, redstone, sign, timer, irq, storage,
+                    timerAutomatic, redstoneIrq, signIrqSides, index, snapshot);
+        }
+    }
     record MachineState(boolean powered, boolean psuHigh, HardwareProfile hardware, int shardTier, String memoryId, ShardSpeed speed) {
         public boolean shardPresent() { return shardTier != 0; }
     }
@@ -55,6 +61,8 @@ public interface DebuggerBackend extends AutoCloseable {
     void selectChannel(int channel);
     void selectSign(int sign);
     void selectTimer(int timer);
+    void selectKeyboard(int slot);
+    void keyboardInput(int slot, int value);
     void sendIrq(int deviceId);
     void timerAutomatic(int timer, boolean automatic);
     void writeTimer(int timer, int reload, int control);

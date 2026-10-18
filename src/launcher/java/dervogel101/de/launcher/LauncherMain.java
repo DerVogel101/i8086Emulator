@@ -323,7 +323,7 @@ public final class LauncherMain {
                 && (!remote || selected().canEdit());
         memoryView.update(snapshot.memoryBase(), snapshot.memory(), loaded);
         ioView.update(snapshot.ioBase(), snapshot.io(), loaded);
-        deviceView.update(snapshot.devices(), snapshot.images(), loaded);
+        deviceView.update(snapshot.devices(), snapshot.images(), loaded, snapshot.machine());
         testPinControl.setSelected(snapshot.testHigh());
         nvramStatus.setText(remote ? "NVRAM: managed by Minecraft" : "NVRAM: " + (snapshot.images().nvramPath() == null
                 ? "Unsaved" : snapshot.images().nvramPath().getFileName())

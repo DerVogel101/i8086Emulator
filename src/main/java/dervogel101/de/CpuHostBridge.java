@@ -26,6 +26,7 @@ public final class CpuHostBridge {
 
     public void submitKeyboardConnection(int slot, boolean connected) { io.keyboards.connect(slot, connected); }
     public boolean submitKeyboardInput(int slot, int value) { return io.keyboards.offer(slot, value); }
+    public dervogel101.de.i86.runtime.KeyboardDevice.Snapshot keyboardSnapshot(int slot) { return io.keyboards.snapshot(slot); }
 
     private static final int TERMINAL_CAPACITY = 16_384;
     private static final Charset WINDOWS_1252 = Charset.forName("windows-1252");
